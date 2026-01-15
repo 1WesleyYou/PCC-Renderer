@@ -3,6 +3,21 @@
 基于 Piecewise Constant Curvature 模型
 两块正三角形板子通过三根气动 origami actuator 连接
 Actuator 是等曲率弧形
+
+坐标系（倒挂配置）：
+- 固定端（Base）在上方 z=0
+- 自由端（End）向下延伸（负 Z 方向）
+- X 轴指向 actuator 0 方向
+- Y 轴满足右手定则
+
+PCC 模型约束：
+- 单段 PCC 只有 2 个自由度：弯曲方向 φ 和弯曲角 θ_bend
+- 所有 actuator 是同心圆弧，垂直于两端平台
+- 不能产生扭转（Yaw）
+
+正向运动学输入：
+- 方式 1: 弯曲方向 φ + 弯曲角 θ_bend + 弧长 s
+- 方式 2: 末端法向量方向（自动投影到有效 PCC 配置）
 """
 
 import pygame
@@ -18,236 +33,462 @@ TRIANGLE_THICKNESS = 7.0  # 三角形板子厚度 (cm)
 ACTUATOR_MIN = 35.0       # actuator 最短长度 (cm)
 ACTUATOR_MAX = 65.0       # actuator 最长长度 (cm)
 ARC_SEGMENTS = 32         # 弧形分段数
+DEFAULT_ARC_LENGTH = 50.0 # 默认中轴弧长 (cm)
+MAX_BEND_ANGLE = math.radians(60)  # 最大弯曲角度
 
 # 窗口设置
 WINDOW_WIDTH = 1200
 WINDOW_HEIGHT = 800
 
 # 颜色定义 (RGB, 0-1 范围)
-COLOR_TRIANGLE_BASE = (0.2, 0.6, 0.9, 0.85)     # 底部三角形 - 蓝色
-COLOR_TRIANGLE_TOP = (0.9, 0.4, 0.2, 0.85)      # 顶部三角形 - 橙色
+COLOR_TRIANGLE_FIXED = (0.2, 0.6, 0.9, 0.85)    # 固定端（上方）- 蓝色
+COLOR_TRIANGLE_FREE = (0.9, 0.4, 0.2, 0.85)     # 自由端（下方）- 橙色
 COLOR_TRIANGLE_SIDE = (0.4, 0.4, 0.5, 0.7)      # 三棱柱侧面
-COLOR_ACTUATOR_1 = (0.95, 0.25, 0.3, 1.0)       # actuator 1 - 红色
-COLOR_ACTUATOR_2 = (0.25, 0.95, 0.35, 1.0)      # actuator 2 - 绿色
-COLOR_ACTUATOR_3 = (0.35, 0.25, 0.95, 1.0)      # actuator 3 - 蓝色
+COLOR_ACTUATOR_0 = (0.95, 0.25, 0.3, 1.0)       # actuator 0 - 红色 (X轴方向)
+COLOR_ACTUATOR_1 = (0.25, 0.95, 0.35, 1.0)      # actuator 1 - 绿色 (120°方向)
+COLOR_ACTUATOR_2 = (0.35, 0.25, 0.95, 1.0)      # actuator 2 - 蓝色 (240°方向)
 COLOR_GRID = (0.3, 0.3, 0.3, 0.5)               # 网格颜色
+COLOR_CENTER_LINE = (1.0, 1.0, 0.3, 1.0)        # 中心线 - 黄色
+COLOR_MOUNT = (0.5, 0.5, 0.6, 0.9)              # 固定支架颜色
 
 
-def get_equilateral_triangle_vertices(side_length, center_z=0):
+def rotation_matrix_axis_angle(axis, angle):
+    """
+    根据轴-角表示创建旋转矩阵（罗德里格斯公式）
+    """
+    axis = np.array(axis, dtype=float)
+    norm = np.linalg.norm(axis)
+    if norm < 1e-10:
+        return np.eye(3)
+    axis = axis / norm
+    
+    K = np.array([
+        [0, -axis[2], axis[1]],
+        [axis[2], 0, -axis[0]],
+        [-axis[1], axis[0], 0]
+    ])
+    
+    R = np.eye(3) + math.sin(angle) * K + (1 - math.cos(angle)) * (K @ K)
+    return R
+
+
+def get_equilateral_triangle_vertices(side_length, center=np.array([0, 0, 0])):
     """
     获取正三角形顶点坐标
-    一个顶点在 x 轴正方向上
-    三角形中心在原点
+    顶点 0 在 X 轴正方向
     """
-    # 正三角形外接圆半径
     R = side_length / math.sqrt(3)
-    
-    # 三个顶点，第一个在 x 轴正方向
     vertices = []
     for i in range(3):
-        angle = i * 2 * math.pi / 3  # 0°, 120°, 240°
-        x = R * math.cos(angle)
-        y = R * math.sin(angle)
-        z = center_z
-        vertices.append((x, y, z))
-    
+        angle = i * 2 * math.pi / 3
+        x = center[0] + R * math.cos(angle)
+        y = center[1] + R * math.sin(angle)
+        z = center[2]
+        vertices.append(np.array([x, y, z]))
     return vertices
 
 
-def calculate_arc_points(start, end, arc_length, num_segments=ARC_SEGMENTS):
+# ============================================================
+# PCC 正向运动学（正确的约束模型）
+# ============================================================
+
+class PCCForwardKinematics:
     """
-    计算等曲率弧形的点
-    给定起点、终点和弧长，计算弧形上的点
+    PCC (Piecewise Constant Curvature) 正向运动学
     
-    对于等曲率弧（圆弧），弧长 L = R * theta
-    其中 R 是曲率半径，theta 是圆心角
+    单段 PCC 的自由度：
+    - 弯曲方向 φ (phi): 在 XY 平面内的角度，决定弯曲朝向
+    - 弯曲角度 θ_bend (theta_bend): 弯曲的程度
+    - 弧长 s: 中心线的长度
     
-    弦长 chord = 2 * R * sin(theta/2)
-    所以 chord / L = 2 * sin(theta/2) / theta
+    约束：
+    - 曲率 κ = θ_bend / s
+    - 所有 actuator 垂直于两端平台
+    - 不能产生扭转
+    
+    倒挂配置：
+    - 固定端在 z=0，自由端向下（-Z 方向）
     """
-    start = np.array(start)
-    end = np.array(end)
     
-    # 计算弦长（起点到终点的直线距离）
-    chord_length = np.linalg.norm(end - start)
+    def __init__(self, triangle_side=TRIANGLE_SIDE):
+        self.triangle_side = triangle_side
+        self.r = triangle_side / math.sqrt(3)  # 外接圆半径
+        self.actuator_angles = [0, 2*math.pi/3, 4*math.pi/3]
     
-    # 如果弧长约等于弦长，几乎是直线
-    if abs(arc_length - chord_length) < 0.01:
-        # 返回直线上的点
+    def forward_kinematics(self, phi, theta_bend, arc_length):
+        """
+        正向运动学：从 PCC 参数计算机械臂状态
+        
+        参数：
+            phi: 弯曲方向角（弧度），0 表示向 X+ 弯曲，π/2 表示向 Y+ 弯曲
+            theta_bend: 弯曲角度（弧度），正值表示弯曲
+            arc_length: 中轴弧长 s (cm)
+        
+        返回：
+            dict: PCC 参数和几何信息
+        """
+        s = arc_length
+        theta_bend = max(0, min(MAX_BEND_ANGLE, abs(theta_bend)))  # 限制弯曲角度
+        
+        if theta_bend < 1e-6:
+            # 无弯曲（直立状态）
+            kappa = 0
+            
+            end_center = np.array([0, 0, -s])
+            end_rotation = np.eye(3)
+            end_normal = np.array([0, 0, -1])
+            
+            # 所有 actuator 长度相等
+            actuator_lengths = [s, s, s]
+        else:
+            # 有弯曲
+            kappa = theta_bend / s
+            R_bend = 1.0 / kappa
+            
+            # 末端位置
+            # 在弯曲平面内：
+            # x_local = R * (1 - cos(θ))（向弯曲方向偏移）
+            # z_local = -R * sin(θ)（向下）
+            x_local = R_bend * (1 - math.cos(theta_bend))
+            z_local = -R_bend * math.sin(theta_bend)
+            
+            end_center = np.array([
+                x_local * math.cos(phi),
+                x_local * math.sin(phi),
+                z_local
+            ])
+            
+            # 末端姿态：绕弯曲轴旋转 theta_bend
+            # 弯曲轴 = (-sin(φ), cos(φ), 0)，垂直于弯曲方向
+            bend_axis = np.array([-math.sin(phi), math.cos(phi), 0])
+            end_rotation = rotation_matrix_axis_angle(bend_axis, theta_bend)
+            end_normal = end_rotation @ np.array([0, 0, -1])
+            
+            # 计算 actuator 长度
+            # l_i = s * (1 + r * κ * cos(θ_i - φ))
+            # 注意：这里的符号确保弯曲方向正确
+            actuator_lengths = []
+            for i in range(3):
+                theta_i = self.actuator_angles[i]
+                l_i = s * (1 + self.r * kappa * math.cos(theta_i - phi))
+                actuator_lengths.append(l_i)
+        
+        return {
+            'phi': phi,
+            'theta_bend': theta_bend,
+            's': s,
+            'kappa': kappa,
+            'end_center': end_center,
+            'end_rotation': end_rotation,
+            'end_normal': end_normal,
+            'actuator_lengths': actuator_lengths,
+            'bend_axis': np.array([-math.sin(phi), math.cos(phi), 0]) if theta_bend > 1e-6 else np.array([0, 1, 0])
+        }
+    
+    def forward_kinematics_from_tilt(self, tilt_x, tilt_y, arc_length):
+        """
+        从倾斜角度计算 PCC 参数
+        
+        这是一种更直观的输入方式：
+        - tilt_x: 末端相对于垂直方向在 XZ 平面内的倾斜角度
+        - tilt_y: 末端相对于垂直方向在 YZ 平面内的倾斜角度
+        
+        这两个角度会被转换为 PCC 的 (phi, theta_bend)
+        """
+        # 计算末端法向量的方向
+        # 初始法向量是 (0, 0, -1)，倾斜后变为...
+        
+        # 将 tilt 角度转换为 PCC 参数
+        # theta_bend = sqrt(tilt_x^2 + tilt_y^2)
+        # phi = atan2(tilt_y, tilt_x)
+        
+        theta_bend = math.sqrt(tilt_x**2 + tilt_y**2)
+        theta_bend = min(theta_bend, MAX_BEND_ANGLE)
+        
+        if theta_bend < 1e-6:
+            phi = 0
+        else:
+            phi = math.atan2(tilt_y, tilt_x)
+        
+        return self.forward_kinematics(phi, theta_bend, arc_length)
+    
+    def get_center_arc_points(self, fk_result, num_segments=ARC_SEGMENTS):
+        """获取中心线弧形上的点"""
+        s = fk_result['s']
+        kappa = fk_result['kappa']
+        phi = fk_result['phi']
+        
         points = []
-        for i in range(num_segments + 1):
-            t = i / num_segments
-            point = start + t * (end - start)
-            points.append(tuple(point))
+        
+        if kappa < 1e-6:
+            for i in range(num_segments + 1):
+                t = i / num_segments
+                z = -t * s
+                points.append(np.array([0, 0, z]))
+        else:
+            R_bend = 1.0 / kappa
+            theta_total = fk_result['theta_bend']
+            
+            for i in range(num_segments + 1):
+                t = i / num_segments
+                theta = t * theta_total
+                
+                x_local = R_bend * (1 - math.cos(theta))
+                z_local = -R_bend * math.sin(theta)
+                
+                x = x_local * math.cos(phi)
+                y = x_local * math.sin(phi)
+                z = z_local
+                
+                points.append(np.array([x, y, z]))
+        
         return points
     
-    # 对于圆弧：chord = 2 * R * sin(theta/2), arc = R * theta
-    # 所以 chord/arc = 2*sin(theta/2)/theta
-    # 需要数值求解 theta
-    
-    ratio = chord_length / arc_length
-    
-    # 数值求解 theta (圆心角)
-    # 使用牛顿法或二分法
-    def f(theta):
-        if abs(theta) < 0.0001:
-            return 1.0 - ratio
-        return 2 * math.sin(theta / 2) / theta - ratio
-    
-    # 二分法求解
-    theta_low, theta_high = 0.001, math.pi * 1.99
-    for _ in range(50):
-        theta_mid = (theta_low + theta_high) / 2
-        if f(theta_mid) > 0:
-            theta_low = theta_mid
-        else:
-            theta_high = theta_mid
-    
-    theta = theta_mid
-    R = arc_length / theta  # 曲率半径
-    
-    # 计算弧的几何参数
-    # 弧在起点和终点之间弯曲，需要确定弯曲方向
-    
-    # 起点到终点的方向向量
-    direction = end - start
-    direction_norm = direction / chord_length
-    
-    # 中点
-    midpoint = (start + end) / 2
-    
-    # 需要确定垂直于弦的方向（弧弯曲的方向）
-    # 对于 3D，我们选择一个合理的垂直方向
-    # 默认让弧向外弯曲（远离中心轴）
-    
-    # 计算一个垂直于 direction 的向量
-    # 优先选择使弧向外凸出的方向
-    if abs(direction_norm[2]) < 0.99:
-        # 使用 z 轴作为参考
-        up = np.array([0, 0, 1])
-    else:
-        # 如果 direction 接近 z 轴，使用 x 轴
-        up = np.array([1, 0, 0])
-    
-    # 计算垂直于弦的方向
-    perpendicular = np.cross(direction_norm, up)
-    perp_norm = np.linalg.norm(perpendicular)
-    if perp_norm > 0.001:
-        perpendicular = perpendicular / perp_norm
-    else:
-        perpendicular = np.array([1, 0, 0])
-    
-    # 圆心到弦中点的距离
-    h = R * math.cos(theta / 2)
-    
-    # 弧的凸出高度
-    sagitta = R - h
-    
-    # 圆心位置 (在弦的垂直方向上，距离中点 h)
-    # 让弧向外凸出（远离原点方向）
-    midpoint_from_origin = midpoint[:2]  # xy 平面上的位置
-    mid_dist = np.linalg.norm(midpoint_from_origin)
-    
-    if mid_dist > 0.001:
-        # 让弧向外凸出
-        outward = np.array([midpoint_from_origin[0]/mid_dist, 
-                           midpoint_from_origin[1]/mid_dist, 0])
-        # 计算 perpendicular 在 outward 方向的分量
-        dot_product = np.dot(perpendicular, outward)
-        if dot_product < 0:
-            perpendicular = -perpendicular
-    
-    center = midpoint - perpendicular * h
-    
-    # 生成弧上的点
-    points = []
-    
-    # 从起点到终点绕圆心旋转
-    start_vec = start - center
-    
-    # 旋转轴：垂直于弧所在平面的方向
-    rotation_axis = np.cross(start - center, end - center)
-    rot_axis_norm = np.linalg.norm(rotation_axis)
-    if rot_axis_norm > 0.001:
-        rotation_axis = rotation_axis / rot_axis_norm
-    else:
-        rotation_axis = np.array([0, 0, 1])
-    
-    for i in range(num_segments + 1):
-        t = i / num_segments
-        angle = t * theta
+    def get_actuator_arc_points(self, fk_result, actuator_index, num_segments=ARC_SEGMENTS):
+        """
+        获取特定 actuator 弧形上的点
         
-        # 使用罗德里格斯旋转公式
-        cos_a = math.cos(angle)
-        sin_a = math.sin(angle)
+        严格等曲率圆弧模型：
+        1. 所有 actuator 曲率相同 κ
+        2. 起点切线垂直于固定端板
+        3. 终点切线垂直于自由端板（自动满足，因为同心圆弧）
+        4. 三角形会变形（物理必然）
         
-        v = start_vec
-        k = rotation_axis
+        每个 actuator 的弯曲平面包含：起点、起点切线、和弯曲方向
+        """
+        kappa = fk_result['kappa']
+        phi = fk_result['phi']
+        theta_bend = fk_result['theta_bend']
+        actuator_angle = self.actuator_angles[actuator_index]
+        actuator_length = fk_result['actuator_lengths'][actuator_index]
         
-        rotated = v * cos_a + np.cross(k, v) * sin_a + k * np.dot(k, v) * (1 - cos_a)
-        point = center + rotated
-        points.append(tuple(point))
+        # 起点（固定端三角形顶点）
+        P0 = np.array([
+            self.r * math.cos(actuator_angle),
+            self.r * math.sin(actuator_angle),
+            0
+        ])
+        
+        points = [P0.copy()]
+        
+        if kappa < 1e-6:
+            # 直线情况
+            for i in range(1, num_segments + 1):
+                t = i / num_segments
+                z = -t * actuator_length
+                points.append(np.array([P0[0], P0[1], z]))
+            return points
+        
+        # 该 actuator 的弯曲半径
+        # R_i = l_i / theta_bend（因为弧长 = 半径 × 角度）
+        R_act = actuator_length / theta_bend
+        
+        # 弯曲轴（所有 actuator 共享同一弯曲轴，垂直于弯曲方向）
+        bend_axis = np.array([-math.sin(phi), math.cos(phi), 0])
+        
+        # 起点切线方向（垂直于固定端板，向下）
+        T0 = np.array([0, 0, -1])
+        
+        # 圆心位置：从起点沿垂直于切线的方向偏移 R_act
+        # 垂直于 T0 且在弯曲平面内的方向
+        # 弯曲平面由 T0 和弯曲方向定义
+        bend_dir = np.array([math.cos(phi), math.sin(phi), 0])
+        
+        # 圆心方向（垂直于 T0，在弯曲方向上）
+        # 对于向 phi 方向弯曲，圆心在 -bend_dir 方向
+        center_dir = -bend_dir
+        
+        # 圆心位置
+        center = P0 + R_act * center_dir
+        
+        # 生成圆弧点
+        for i in range(1, num_segments + 1):
+            t = i / num_segments
+            angle = t * theta_bend
+            
+            # 从起点绕弯曲轴旋转
+            # 起点相对于圆心的向量
+            v0 = P0 - center
+            
+            # 绕弯曲轴旋转 angle
+            rot = rotation_matrix_axis_angle(bend_axis, angle)
+            v = rot @ v0
+            
+            point = center + v
+            points.append(point)
+        
+        return points
     
-    return points
+    def verify_perpendicularity(self, fk_result):
+        """
+        验证 actuator 是否垂直于两端平台
+        
+        在 PCC 模型中，actuator 切线应该与中心线切线平行（都垂直于截面盘）
+        
+        检查方法：比较 actuator 切线与中心线切线的夹角
+        """
+        angles = []
+        
+        # 获取中心线点以计算切线
+        center_arc = self.get_center_arc_points(fk_result)
+        
+        for i in range(3):
+            arc_points = self.get_actuator_arc_points(fk_result, i)
+            
+            angle_start = 0
+            angle_end = 0
+            
+            # 在起点（固定端）检查
+            if len(arc_points) >= 2 and len(center_arc) >= 2:
+                tangent_act = np.array(arc_points[1]) - np.array(arc_points[0])
+                tangent_center = np.array(center_arc[1]) - np.array(center_arc[0])
+                
+                norm_act = np.linalg.norm(tangent_act)
+                norm_center = np.linalg.norm(tangent_center)
+                
+                if norm_act > 1e-10 and norm_center > 1e-10:
+                    tangent_act = tangent_act / norm_act
+                    tangent_center = tangent_center / norm_center
+                    dot_start = abs(np.dot(tangent_act, tangent_center))
+                    angle_start = math.degrees(math.acos(np.clip(dot_start, 0, 1)))
+            
+            # 在终点（自由端）检查
+            if len(arc_points) >= 2 and len(center_arc) >= 2:
+                tangent_act = np.array(arc_points[-1]) - np.array(arc_points[-2])
+                tangent_center = np.array(center_arc[-1]) - np.array(center_arc[-2])
+                
+                norm_act = np.linalg.norm(tangent_act)
+                norm_center = np.linalg.norm(tangent_center)
+                
+                if norm_act > 1e-10 and norm_center > 1e-10:
+                    tangent_act = tangent_act / norm_act
+                    tangent_center = tangent_center / norm_center
+                    dot_end = abs(np.dot(tangent_act, tangent_center))
+                    angle_end = math.degrees(math.acos(np.clip(dot_end, 0, 1)))
+            
+            angles.append({
+                'actuator': i,
+                'angle_at_fixed_end': angle_start,
+                'angle_at_free_end': angle_end
+            })
+        
+        return angles
 
+
+# ============================================================
+# 软体机械臂类
+# ============================================================
 
 class SoftRobotArm:
-    """软体机械臂类"""
+    """
+    软体机械臂类（倒挂配置）
+    
+    使用正确的 PCC 参数：
+    - phi: 弯曲方向
+    - theta_bend: 弯曲角度
+    - arc_length: 弧长
+    """
     
     def __init__(self):
-        # 初始 actuator 长度 (都设为中间值)
-        self.actuator_lengths = [50.0, 50.0, 50.0]  # cm
+        self.fk = PCCForwardKinematics(TRIANGLE_SIDE)
         
-        # 底部三角形的 z 位置（考虑厚度）
-        # 底部三棱柱的底面在 z=0，顶面在 z=TRIANGLE_THICKNESS
-        self.base_z_bottom = 0.0
-        self.base_z_top = TRIANGLE_THICKNESS
+        # PCC 参数
+        self.phi = 0.0              # 弯曲方向
+        self.theta_bend = 0.0       # 弯曲角度
+        self.arc_length = DEFAULT_ARC_LENGTH
         
-        # 底部三角形顶点
-        self.base_vertices_bottom = get_equilateral_triangle_vertices(
-            TRIANGLE_SIDE, center_z=self.base_z_bottom)
-        self.base_vertices_top = get_equilateral_triangle_vertices(
-            TRIANGLE_SIDE, center_z=self.base_z_top)
+        # 更直观的控制：倾斜角度
+        self.tilt_x = 0.0  # X 方向倾斜
+        self.tilt_y = 0.0  # Y 方向倾斜
         
-        # 顶部三角形顶点 (会根据 actuator 长度计算)
-        self._calculate_top_vertices()
+        # 固定端位置
+        self.fixed_z = 0.0
+        
+        self._update_geometry()
     
-    def _calculate_top_vertices(self):
-        """
-        根据 actuator 长度计算顶部三角形位置
-        简化模型：顶部三角形保持平行，每个顶点的 z 坐标由对应 actuator 决定
-        """
-        # 简化模型：顶部三角形每个顶点直接在底部顶点正上方
-        # z 坐标 = 底部顶面 z + actuator 长度
+    def set_pcc_params(self, phi, theta_bend, arc_length):
+        """直接设置 PCC 参数"""
+        self.phi = phi
+        self.theta_bend = max(0, min(MAX_BEND_ANGLE, theta_bend))
+        self.arc_length = max(ACTUATOR_MIN, min(ACTUATOR_MAX, arc_length))
         
-        self.top_vertices_bottom = []
-        self.top_vertices_top = []
+        # 更新 tilt 值以保持同步
+        self.tilt_x = self.theta_bend * math.cos(self.phi)
+        self.tilt_y = self.theta_bend * math.sin(self.phi)
         
-        for i, base_v in enumerate(self.base_vertices_top):
-            # 顶部三棱柱底面
-            x = base_v[0]
-            y = base_v[1]
-            z_bottom = self.base_z_top + self.actuator_lengths[i]
-            z_top = z_bottom + TRIANGLE_THICKNESS
-            
-            self.top_vertices_bottom.append((x, y, z_bottom))
-            self.top_vertices_top.append((x, y, z_top))
+        self._update_geometry()
     
-    def set_actuator_length(self, index, length):
-        """设置 actuator 长度"""
-        length = max(ACTUATOR_MIN, min(ACTUATOR_MAX, length))
-        self.actuator_lengths[index] = length
-        self._calculate_top_vertices()
-    
-    def get_actuator_arc_points(self, index):
-        """获取 actuator 弧形的点"""
-        # actuator 连接底部三棱柱顶面顶点到顶部三棱柱底面顶点
-        start = self.base_vertices_top[index]
-        end = self.top_vertices_bottom[index]
-        arc_length = self.actuator_lengths[index]
+    def set_tilt(self, tilt_x, tilt_y):
+        """使用倾斜角度设置姿态"""
+        self.tilt_x = tilt_x
+        self.tilt_y = tilt_y
         
-        return calculate_arc_points(start, end, arc_length)
+        # 转换为 PCC 参数
+        self.theta_bend = math.sqrt(tilt_x**2 + tilt_y**2)
+        self.theta_bend = min(self.theta_bend, MAX_BEND_ANGLE)
+        
+        if self.theta_bend > 1e-6:
+            self.phi = math.atan2(tilt_y, tilt_x)
+        
+        self._update_geometry()
+    
+    def set_arc_length(self, s):
+        """设置弧长"""
+        self.arc_length = max(ACTUATOR_MIN, min(ACTUATOR_MAX, s))
+        self._update_geometry()
+    
+    def _update_geometry(self):
+        """更新几何状态"""
+        self.pcc_result = self.fk.forward_kinematics(
+            self.phi, self.theta_bend, self.arc_length
+        )
+        
+        # 固定端三棱柱
+        # 顶面在 z=0，底面在 z=-TRIANGLE_THICKNESS
+        self.fixed_vertices_top = get_equilateral_triangle_vertices(
+            TRIANGLE_SIDE, center=np.array([0, 0, self.fixed_z])
+        )
+        self.fixed_vertices_bottom = get_equilateral_triangle_vertices(
+            TRIANGLE_SIDE, center=np.array([0, 0, self.fixed_z - TRIANGLE_THICKNESS])
+        )
+        
+        # 计算中心线和 Actuator 弧线
+        center_arc_raw = self.fk.get_center_arc_points(self.pcc_result)
+        self.center_arc = [pt - np.array([0, 0, TRIANGLE_THICKNESS]) for pt in center_arc_raw]
+        
+        self.actuator_arcs = []
+        for i in range(3):
+            arc = self.fk.get_actuator_arc_points(self.pcc_result, i)
+            adjusted_arc = [pt - np.array([0, 0, TRIANGLE_THICKNESS]) for pt in arc]
+            self.actuator_arcs.append(adjusted_arc)
+        
+        # 自由端三角形顶点 = 圆弧终点（三角形会变形，这是物理必然）
+        self.free_vertices_top = []
+        for i in range(3):
+            top_vertex = self.actuator_arcs[i][-1].copy()
+            self.free_vertices_top.append(top_vertex)
+        
+        # 板的法向量：所有 actuator 终点切线相同（同心圆弧特性）
+        # 使用第一个 actuator 的终点切线
+        arc = self.actuator_arcs[0]
+        if len(arc) >= 2:
+            tangent = np.array(arc[-1]) - np.array(arc[-2])
+            tangent = tangent / np.linalg.norm(tangent)
+            self.end_tangent = tangent
+        else:
+            self.end_tangent = self.pcc_result['end_normal']
+        
+        # 自由端底面顶点 = 顶面顶点沿法向量方向偏移
+        self.free_vertices_bottom = []
+        for i in range(3):
+            top_vertex = self.free_vertices_top[i]
+            bottom_vertex = top_vertex + self.end_tangent * TRIANGLE_THICKNESS
+            self.free_vertices_bottom.append(bottom_vertex)
 
+
+# ============================================================
+# 渲染器
+# ============================================================
 
 class Renderer:
     """OpenGL 渲染器"""
@@ -255,55 +496,48 @@ class Renderer:
     def __init__(self):
         pygame.init()
         pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), DOUBLEBUF | OPENGL)
-        pygame.display.set_caption("软体机械臂 PCC 模型渲染器")
+        pygame.display.set_caption("软体机械臂 PCC 模型 - 倒挂配置 (正确约束)")
         
-        # 设置 OpenGL
         self._setup_opengl()
         
-        # 相机参数
-        self.camera_distance = 180.0
-        self.camera_angle_x = 25.0  # 俯仰角
-        self.camera_angle_y = 45.0  # 偏航角
+        self.camera_distance = 200.0
+        self.camera_angle_x = -20.0
+        self.camera_angle_y = 45.0
         
-        # 鼠标控制
         self.mouse_dragging = False
         self.last_mouse_pos = (0, 0)
         
-        # 机械臂模型
         self.robot = SoftRobotArm()
+        
+        self.show_center_line = True
+        self.show_mount = True
+        self.show_perpendicularity_check = False
     
     def _setup_opengl(self):
-        """设置 OpenGL 参数"""
         glEnable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glEnable(GL_LINE_SMOOTH)
         glHint(GL_LINE_SMOOTH_HINT, GL_NICEST)
         
-        # 启用光照
         glEnable(GL_LIGHTING)
         glEnable(GL_LIGHT0)
         glEnable(GL_COLOR_MATERIAL)
         glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE)
         
-        # 设置光源
-        glLightfv(GL_LIGHT0, GL_POSITION, (100, 200, 100, 1))
+        glLightfv(GL_LIGHT0, GL_POSITION, (100, 100, 200, 1))
         glLightfv(GL_LIGHT0, GL_AMBIENT, (0.3, 0.3, 0.3, 1))
         glLightfv(GL_LIGHT0, GL_DIFFUSE, (0.8, 0.8, 0.8, 1))
         
-        # 设置背景颜色 - 深色主题
         glClearColor(0.06, 0.06, 0.1, 1.0)
         
-        # 设置投影
         glMatrixMode(GL_PROJECTION)
         gluPerspective(45, WINDOW_WIDTH / WINDOW_HEIGHT, 0.1, 1000.0)
         glMatrixMode(GL_MODELVIEW)
     
     def _update_camera(self):
-        """更新相机视角"""
         glLoadIdentity()
         
-        # 计算相机位置
         rad_x = math.radians(self.camera_angle_x)
         rad_y = math.radians(self.camera_angle_y)
         
@@ -311,49 +545,76 @@ class Renderer:
         cam_y = self.camera_distance * math.sin(rad_x)
         cam_z = self.camera_distance * math.cos(rad_x) * math.cos(rad_y)
         
-        # 看向场景中心（稍微向上偏移）
-        look_at_height = 30
+        look_at_height = -25
         gluLookAt(cam_x, cam_z, cam_y,
                   0, look_at_height, 0,
                   0, 1, 0)
     
+    def _to_gl_coords(self, v):
+        if isinstance(v, np.ndarray):
+            return (float(v[0]), float(v[2]), float(v[1]))
+        return (v[0], v[2], v[1])
+    
+    def _draw_mount(self):
+        if not self.show_mount:
+            return
+        
+        glColor4f(*COLOR_MOUNT)
+        mount_width = TRIANGLE_SIDE * 1.5
+        mount_height = 10
+        mount_depth = TRIANGLE_SIDE * 1.5
+        
+        glPushMatrix()
+        glTranslatef(0, mount_height/2, 0)
+        
+        glBegin(GL_QUADS)
+        glNormal3f(0, 1, 0)
+        glVertex3f(-mount_width/2, mount_height/2, -mount_depth/2)
+        glVertex3f(mount_width/2, mount_height/2, -mount_depth/2)
+        glVertex3f(mount_width/2, mount_height/2, mount_depth/2)
+        glVertex3f(-mount_width/2, mount_height/2, mount_depth/2)
+        glNormal3f(0, -1, 0)
+        glVertex3f(-mount_width/2, -mount_height/2, mount_depth/2)
+        glVertex3f(mount_width/2, -mount_height/2, mount_depth/2)
+        glVertex3f(mount_width/2, -mount_height/2, -mount_depth/2)
+        glVertex3f(-mount_width/2, -mount_height/2, -mount_depth/2)
+        glEnd()
+        
+        glPopMatrix()
+    
     def _draw_grid(self):
-        """绘制地面网格"""
         glDisable(GL_LIGHTING)
         glColor4f(*COLOR_GRID)
         glBegin(GL_LINES)
         
         grid_size = 100
         grid_step = 10
+        grid_y = -100
         
         for i in range(-grid_size, grid_size + 1, grid_step):
-            glVertex3f(i, 0, -grid_size)
-            glVertex3f(i, 0, grid_size)
-            glVertex3f(-grid_size, 0, i)
-            glVertex3f(grid_size, 0, i)
+            glVertex3f(i, grid_y, -grid_size)
+            glVertex3f(i, grid_y, grid_size)
+            glVertex3f(-grid_size, grid_y, i)
+            glVertex3f(grid_size, grid_y, i)
         
         glEnd()
         glEnable(GL_LIGHTING)
     
     def _draw_axes(self):
-        """绘制坐标轴"""
         glDisable(GL_LIGHTING)
         axis_length = 30.0
         
         glLineWidth(2.5)
         glBegin(GL_LINES)
         
-        # X 轴 - 红色
         glColor4f(1.0, 0.3, 0.3, 1.0)
         glVertex3f(0, 0, 0)
         glVertex3f(axis_length, 0, 0)
         
-        # Y 轴 - 绿色 (模型的 Y -> OpenGL 的 Z)
         glColor4f(0.3, 1.0, 0.3, 1.0)
         glVertex3f(0, 0, 0)
         glVertex3f(0, 0, axis_length)
         
-        # Z 轴 - 蓝色 (模型的 Z -> OpenGL 的 Y, 向上)
         glColor4f(0.3, 0.3, 1.0, 1.0)
         glVertex3f(0, 0, 0)
         glVertex3f(0, axis_length, 0)
@@ -362,45 +623,33 @@ class Renderer:
         glLineWidth(1.0)
         glEnable(GL_LIGHTING)
     
-    def _to_gl_coords(self, v):
-        """将模型坐标 (x, y, z) 转换为 OpenGL 坐标 (x, z, y)"""
-        return (v[0], v[2], v[1])
-    
-    def _draw_triangular_prism(self, bottom_vertices, top_vertices, 
-                                top_color, side_color):
-        """绘制三棱柱"""
-        # 转换坐标
+    def _draw_triangular_prism(self, bottom_vertices, top_vertices, color, side_color):
         gl_bottom = [self._to_gl_coords(v) for v in bottom_vertices]
         gl_top = [self._to_gl_coords(v) for v in top_vertices]
         
-        # 绘制顶面
-        glColor4f(*top_color)
+        glColor4f(*color)
         glBegin(GL_TRIANGLES)
-        # 计算法向量
         v0 = np.array(gl_top[0])
         v1 = np.array(gl_top[1])
         v2 = np.array(gl_top[2])
         normal = np.cross(v1 - v0, v2 - v0)
-        normal = normal / np.linalg.norm(normal)
+        norm_len = np.linalg.norm(normal)
+        if norm_len > 0:
+            normal = normal / norm_len
         glNormal3f(*normal)
         for v in gl_top:
             glVertex3f(*v)
         glEnd()
         
-        # 绘制底面
         glBegin(GL_TRIANGLES)
-        normal = -normal
-        glNormal3f(*normal)
+        glNormal3f(*(-normal))
         for v in reversed(gl_bottom):
             glVertex3f(*v)
         glEnd()
         
-        # 绘制三个侧面
         glColor4f(*side_color)
         for i in range(3):
             j = (i + 1) % 3
-            
-            # 计算侧面法向量
             v0 = np.array(gl_bottom[i])
             v1 = np.array(gl_bottom[j])
             v2 = np.array(gl_top[i])
@@ -419,24 +668,20 @@ class Renderer:
             glVertex3f(*gl_top[i])
             glEnd()
         
-        # 绘制边框
         glDisable(GL_LIGHTING)
         glColor4f(1.0, 1.0, 1.0, 0.8)
         glLineWidth(1.5)
         
-        # 顶面边框
         glBegin(GL_LINE_LOOP)
         for v in gl_top:
             glVertex3f(*v)
         glEnd()
         
-        # 底面边框
         glBegin(GL_LINE_LOOP)
         for v in gl_bottom:
             glVertex3f(*v)
         glEnd()
         
-        # 垂直边
         glBegin(GL_LINES)
         for i in range(3):
             glVertex3f(*gl_bottom[i])
@@ -446,54 +691,22 @@ class Renderer:
         glLineWidth(1.0)
         glEnable(GL_LIGHTING)
         
-        # 绘制顶点球
         for v in gl_top:
             self._draw_sphere(v, 1.2, (1.0, 1.0, 1.0, 1.0))
         for v in gl_bottom:
             self._draw_sphere(v, 1.2, (0.8, 0.8, 0.8, 1.0))
     
     def _draw_sphere(self, position, radius, color):
-        """绘制球体"""
         glColor4f(*color)
         glPushMatrix()
         glTranslatef(*position)
-        
         quadric = gluNewQuadric()
         gluSphere(quadric, radius, 16, 16)
         gluDeleteQuadric(quadric)
-        
         glPopMatrix()
     
-    def _draw_arc(self, points, color, line_width=4.0):
-        """绘制弧形"""
-        glDisable(GL_LIGHTING)
-        
-        # 转换坐标
-        gl_points = [self._to_gl_coords(p) for p in points]
-        
-        # 绘制弧形线条
-        glColor4f(*color)
-        glLineWidth(line_width)
-        
-        glBegin(GL_LINE_STRIP)
-        for p in gl_points:
-            glVertex3f(*p)
-        glEnd()
-        
-        glLineWidth(1.0)
-        
-        # 在弧的中点绘制小球
-        mid_idx = len(gl_points) // 2
-        if mid_idx < len(gl_points):
-            self._draw_sphere(gl_points[mid_idx], 1.5, color)
-        
-        glEnable(GL_LIGHTING)
-    
     def _draw_actuator_tube(self, points, color, radius=1.0):
-        """绘制圆管形状的 actuator（更好的 3D 效果）"""
         gl_points = [self._to_gl_coords(p) for p in points]
-        
-        # 绘制圆管
         glColor4f(*color)
         
         tube_segments = 8
@@ -508,7 +721,6 @@ class Renderer:
                 continue
             direction = direction / length
             
-            # 找一个垂直于 direction 的向量
             if abs(direction[1]) < 0.99:
                 up = np.array([0, 1, 0])
             else:
@@ -518,84 +730,155 @@ class Renderer:
             right = right / np.linalg.norm(right)
             up = np.cross(right, direction)
             
-            # 绘制圆管段
             glBegin(GL_QUAD_STRIP)
             for j in range(tube_segments + 1):
                 angle = j * 2 * math.pi / tube_segments
                 offset = right * math.cos(angle) * radius + up * math.sin(angle) * radius
-                
                 normal = offset / radius
                 glNormal3f(*normal)
-                
                 v1 = p1 + offset
                 v2 = p2 + offset
                 glVertex3f(*v1)
                 glVertex3f(*v2)
             glEnd()
         
-        # 在端点绘制球体
         self._draw_sphere(gl_points[0], radius * 1.5, color)
         self._draw_sphere(gl_points[-1], radius * 1.5, color)
     
+    def _draw_center_line(self, points, color, line_width=2.0):
+        glDisable(GL_LIGHTING)
+        gl_points = [self._to_gl_coords(p) for p in points]
+        glColor4f(*color)
+        glLineWidth(line_width)
+        glBegin(GL_LINE_STRIP)
+        for p in gl_points:
+            glVertex3f(*p)
+        glEnd()
+        glLineWidth(1.0)
+        glEnable(GL_LIGHTING)
+    
+    def _draw_normal_arrows(self):
+        """绘制法向量箭头，验证垂直性"""
+        if not self.show_perpendicularity_check:
+            return
+        
+        glDisable(GL_LIGHTING)
+        glLineWidth(2.0)
+        
+        # 固定端法向量（向下）
+        glColor4f(1.0, 1.0, 0.0, 1.0)
+        glBegin(GL_LINES)
+        glVertex3f(0, -TRIANGLE_THICKNESS, 0)
+        glVertex3f(0, -TRIANGLE_THICKNESS - 15, 0)
+        glEnd()
+        
+        # 自由端法向量
+        end_center = self.robot.pcc_result['end_center']
+        end_normal = self.robot.pcc_result['end_normal']
+        start = self._to_gl_coords(end_center - np.array([0, 0, TRIANGLE_THICKNESS]))
+        end_pt = end_center - np.array([0, 0, TRIANGLE_THICKNESS]) + end_normal * 15
+        end_gl = self._to_gl_coords(end_pt)
+        
+        glColor4f(1.0, 0.5, 0.0, 1.0)
+        glBegin(GL_LINES)
+        glVertex3f(*start)
+        glVertex3f(*end_gl)
+        glEnd()
+        
+        glLineWidth(1.0)
+        glEnable(GL_LIGHTING)
+    
     def _draw_robot(self):
-        """绘制机械臂"""
-        # 绘制底部三棱柱
         self._draw_triangular_prism(
-            self.robot.base_vertices_bottom,
-            self.robot.base_vertices_top,
-            COLOR_TRIANGLE_BASE,
+            self.robot.fixed_vertices_bottom,
+            self.robot.fixed_vertices_top,
+            COLOR_TRIANGLE_FIXED,
             COLOR_TRIANGLE_SIDE
         )
         
-        # 绘制顶部三棱柱
         self._draw_triangular_prism(
-            self.robot.top_vertices_bottom,
-            self.robot.top_vertices_top,
-            COLOR_TRIANGLE_TOP,
+            self.robot.free_vertices_bottom,
+            self.robot.free_vertices_top,
+            COLOR_TRIANGLE_FREE,
             COLOR_TRIANGLE_SIDE
         )
         
-        # 绘制 actuators（等曲率弧形）
-        colors = [COLOR_ACTUATOR_1, COLOR_ACTUATOR_2, COLOR_ACTUATOR_3]
-        
+        colors = [COLOR_ACTUATOR_0, COLOR_ACTUATOR_1, COLOR_ACTUATOR_2]
         for i in range(3):
-            arc_points = self.robot.get_actuator_arc_points(i)
-            # 使用圆管绘制更好的 3D 效果
-            self._draw_actuator_tube(arc_points, colors[i], radius=0.8)
+            self._draw_actuator_tube(self.robot.actuator_arcs[i], colors[i], radius=0.8)
+        
+        if self.show_center_line:
+            self._draw_center_line(self.robot.center_arc, COLOR_CENTER_LINE, line_width=3.0)
+        
+        self._draw_normal_arrows()
     
     def handle_events(self):
-        """处理输入事件"""
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 return False
             
             elif event.type == pygame.KEYDOWN:
+                step = math.radians(3)  # 3度步进
+                
                 if event.key == pygame.K_ESCAPE:
                     return False
                 elif event.key == pygame.K_r:
-                    # 重置
-                    self.robot.actuator_lengths = [50.0, 50.0, 50.0]
-                    self.robot._calculate_top_vertices()
+                    self.robot.set_tilt(0, 0)
+                    self.robot.set_arc_length(DEFAULT_ARC_LENGTH)
+                
+                # Tilt X 控制 (Q/A) - 向 X 方向弯曲
+                elif event.key == pygame.K_q:
+                    self.robot.set_tilt(self.robot.tilt_x + step, self.robot.tilt_y)
+                elif event.key == pygame.K_a:
+                    self.robot.set_tilt(self.robot.tilt_x - step, self.robot.tilt_y)
+                
+                # Tilt Y 控制 (W/S) - 向 Y 方向弯曲
+                elif event.key == pygame.K_w:
+                    self.robot.set_tilt(self.robot.tilt_x, self.robot.tilt_y + step)
+                elif event.key == pygame.K_s:
+                    self.robot.set_tilt(self.robot.tilt_x, self.robot.tilt_y - step)
+                
+                # 弧长控制 (UP/DOWN)
+                elif event.key == pygame.K_UP:
+                    self.robot.set_arc_length(self.robot.arc_length + 2)
+                elif event.key == pygame.K_DOWN:
+                    self.robot.set_arc_length(self.robot.arc_length - 2)
+                
+                # 切换显示
+                elif event.key == pygame.K_c:
+                    self.show_center_line = not self.show_center_line
+                elif event.key == pygame.K_m:
+                    self.show_mount = not self.show_mount
+                elif event.key == pygame.K_p:
+                    self.show_perpendicularity_check = not self.show_perpendicularity_check
+                    if self.show_perpendicularity_check:
+                        # 验证垂直性
+                        perp = self.robot.fk.verify_perpendicularity(self.robot.pcc_result)
+                        print("\n垂直性验证:")
+                        for p in perp:
+                            print(f"  Actuator {p['actuator']}: "
+                                  f"固定端偏差 {p['angle_at_fixed_end']:.2f}°, "
+                                  f"自由端偏差 {p['angle_at_free_end']:.2f}°")
+                
+                # 预设姿态
                 elif event.key == pygame.K_1:
-                    self.robot.set_actuator_length(0, self.robot.actuator_lengths[0] + 2)
+                    self.robot.set_tilt(math.radians(25), 0)
                 elif event.key == pygame.K_2:
-                    self.robot.set_actuator_length(0, self.robot.actuator_lengths[0] - 2)
+                    self.robot.set_tilt(math.radians(-25), 0)
                 elif event.key == pygame.K_3:
-                    self.robot.set_actuator_length(1, self.robot.actuator_lengths[1] + 2)
+                    self.robot.set_tilt(0, math.radians(25))
                 elif event.key == pygame.K_4:
-                    self.robot.set_actuator_length(1, self.robot.actuator_lengths[1] - 2)
+                    self.robot.set_tilt(0, math.radians(-25))
                 elif event.key == pygame.K_5:
-                    self.robot.set_actuator_length(2, self.robot.actuator_lengths[2] + 2)
-                elif event.key == pygame.K_6:
-                    self.robot.set_actuator_length(2, self.robot.actuator_lengths[2] - 2)
+                    self.robot.set_tilt(math.radians(20), math.radians(20))
             
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 1:  # 左键
+                if event.button == 1:
                     self.mouse_dragging = True
                     self.last_mouse_pos = event.pos
-                elif event.button == 4:  # 滚轮上
+                elif event.button == 4:
                     self.camera_distance = max(50, self.camera_distance - 10)
-                elif event.button == 5:  # 滚轮下
+                elif event.button == 5:
                     self.camera_distance = min(500, self.camera_distance + 10)
             
             elif event.type == pygame.MOUSEBUTTONUP:
@@ -616,45 +899,108 @@ class Renderer:
         return True
     
     def render(self):
-        """渲染一帧"""
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
-        
         self._update_camera()
         self._draw_grid()
         self._draw_axes()
+        self._draw_mount()
         self._draw_robot()
-        
         pygame.display.flip()
     
     def run(self):
-        """主循环"""
         clock = pygame.time.Clock()
         running = True
         
-        print("\n" + "=" * 55)
-        print("  软体机械臂 PCC 模型渲染器")
+        print("\n" + "=" * 70)
+        print("  软体机械臂 PCC 模型渲染器 - 倒挂配置 (正确约束)")
         print("  (Piecewise Constant Curvature)")
-        print("=" * 55)
+        print("=" * 70)
         print(f"  三角形边长: {TRIANGLE_SIDE} cm")
         print(f"  三角形厚度: {TRIANGLE_THICKNESS} cm")
-        print(f"  Actuator 范围: {ACTUATOR_MIN} - {ACTUATOR_MAX} cm")
-        print(f"  Actuator 形状: 等曲率弧形")
-        print("\n  控制说明:")
-        print("    鼠标拖拽: 旋转视角")
-        print("    滚轮: 缩放")
-        print("    1/2: Actuator 1 (红) +/-")
-        print("    3/4: Actuator 2 (绿) +/-")
-        print("    5/6: Actuator 3 (蓝) +/-")
-        print("    R: 重置所有 actuator")
+        print(f"  弧长范围: {ACTUATOR_MIN} - {ACTUATOR_MAX} cm")
+        print(f"  最大弯曲角: {math.degrees(MAX_BEND_ANGLE):.0f}°")
+        print("\n  PCC 模型自由度:")
+        print("    - φ (phi): 弯曲方向")
+        print("    - θ (theta_bend): 弯曲角度")
+        print("    - s: 弧长")
+        print("    注意: 单段 PCC 无法产生扭转(Yaw)!")
+        print("\n  控制方式 (倾斜角度):")
+        print("    Q/A: 向 X+/X- 方向弯曲")
+        print("    W/S: 向 Y+/Y- 方向弯曲")
+        print("    ↑/↓: 弧长 +/-")
+        print("\n  预设姿态:")
+        print("    1: 向 X+ 弯曲    2: 向 X- 弯曲")
+        print("    3: 向 Y+ 弯曲    4: 向 Y- 弯曲")
+        print("    5: 对角弯曲")
+        print("\n  其他控制:")
+        print("    C: 切换中心线   M: 切换支架")
+        print("    P: 验证垂直性   R: 重置")
         print("    ESC: 退出")
-        print("=" * 55 + "\n")
+        print("=" * 70 + "\n")
         
         while running:
             running = self.handle_events()
             self.render()
+            
+            r = self.robot
+            result = r.pcc_result
+            print(f"\rφ={math.degrees(r.phi):+6.1f}° "
+                  f"θ={math.degrees(r.theta_bend):5.1f}° "
+                  f"s={r.arc_length:.1f}cm "
+                  f"κ={result['kappa']:.4f} | "
+                  f"L=[{result['actuator_lengths'][0]:.1f}, "
+                  f"{result['actuator_lengths'][1]:.1f}, "
+                  f"{result['actuator_lengths'][2]:.1f}]",
+                  end="", flush=True)
+            
             clock.tick(60)
         
+        print("\n")
         pygame.quit()
+
+
+# ============================================================
+# API 函数
+# ============================================================
+
+def forward_kinematics_pcc(phi, theta_bend, arc_length, triangle_side=TRIANGLE_SIDE):
+    """
+    PCC 正向运动学 - 从 PCC 参数计算机械臂状态
+    
+    参数：
+        phi: 弯曲方向角（弧度），0 = X+ 方向，π/2 = Y+ 方向
+        theta_bend: 弯曲角度（弧度）
+        arc_length: 中轴弧长 (cm)
+        triangle_side: 三角形边长 (cm)
+    
+    返回：
+        dict: PCC 参数和几何信息
+    
+    示例：
+        >>> result = forward_kinematics_pcc(0, math.radians(30), 50)
+        >>> print(f"向 X+ 弯曲 30°: 曲率={result['kappa']:.4f}")
+        >>> print(f"Actuator 长度: {result['actuator_lengths']}")
+    """
+    fk = PCCForwardKinematics(triangle_side)
+    return fk.forward_kinematics(phi, theta_bend, arc_length)
+
+
+def forward_kinematics_tilt(tilt_x, tilt_y, arc_length, triangle_side=TRIANGLE_SIDE):
+    """
+    从倾斜角度计算 PCC 状态
+    
+    参数：
+        tilt_x: X 方向倾斜角（弧度）
+        tilt_y: Y 方向倾斜角（弧度）
+        arc_length: 中轴弧长 (cm)
+    
+    说明：
+        tilt_x 和 tilt_y 会自动转换为 PCC 参数 (phi, theta_bend)
+        theta_bend = sqrt(tilt_x² + tilt_y²)
+        phi = atan2(tilt_y, tilt_x)
+    """
+    fk = PCCForwardKinematics(triangle_side)
+    return fk.forward_kinematics_from_tilt(tilt_x, tilt_y, arc_length)
 
 
 def main():
