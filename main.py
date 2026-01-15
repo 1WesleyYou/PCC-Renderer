@@ -735,9 +735,9 @@ class SoftRobotArm:
         """更新模块链的变换"""
         for i, module in enumerate(self.modules):
             if i == 0:
-                # 第一节：基座在原点
+                # 第一节：基座在原点上方 50cm
                 module.set_base_transform(
-                    np.array([0.0, 0.0, 0.0]),
+                    np.array([0.0, 0.0, 50.0]),
                     np.eye(3)
                 )
             else:
@@ -864,23 +864,24 @@ class Renderer:
         
         self._setup_opengl()
         
-        self.camera_distance = 200.0
+        self.camera_distance = 350.0  # 4节机械臂需要更远的视角
         self.camera_angle_x = -20.0
         self.camera_angle_y = 45.0
         
         self.mouse_dragging = False
         self.last_mouse_pos = (0, 0)
         
-        self.robot = SoftRobotArm()
+        self.robot = SoftRobotArm(num_modules=4)  # 4 节机械臂
         
         self.show_center_line = True
-        self.show_mount = True
+        self.show_mount = False  # 默认隐藏支架
         self.show_perpendicularity_check = False
         
-        # 第二节世界坐标系姿态控制
+        # 各节世界坐标系姿态控制（第 2、3、4 节）
         # 存储目标欧拉角（世界坐标系）
-        self.module2_world_roll = 0.0    # 绕世界 X 轴
-        self.module2_world_pitch = 0.0   # 绕世界 Y 轴
+        # 索引 0 对应第 2 节，索引 1 对应第 3 节，索引 2 对应第 4 节
+        self.world_roll = [0.0, 0.0, 0.0]    # 绕世界 X 轴
+        self.world_pitch = [0.0, 0.0, 0.0]   # 绕世界 Y 轴
         # 注意：PCC 不能产生 yaw，所以不存储 yaw
     
     def _setup_opengl(self):
@@ -915,7 +916,7 @@ class Renderer:
         cam_y = self.camera_distance * math.sin(rad_x)
         cam_z = self.camera_distance * math.cos(rad_x) * math.cos(rad_y)
         
-        look_at_height = -25
+        look_at_height = -50  # 视角看向机械臂中部
         gluLookAt(cam_x, cam_z, cam_y,
                   0, look_at_height, 0,
                   0, 1, 0)
@@ -959,7 +960,7 @@ class Renderer:
         
         grid_size = 100
         grid_step = 10
-        grid_y = -100
+        grid_y = 50  # 与机械臂 base 高度一致
         
         for i in range(-grid_size, grid_size + 1, grid_step):
             glVertex3f(i, grid_y, -grid_size)
@@ -1249,36 +1250,52 @@ class Renderer:
             self.robot._update_chain()
     
     def _handle_world_control(self, event, step):
-        """处理第二节世界坐标系控制"""
+        """处理非第一节的世界坐标系控制"""
+        module_idx = self.robot.active_module
+        if module_idx == 0:
+            return
+        
+        world_idx = module_idx - 1  # 索引从 0 开始，对应第 2、3、4 节
+        
         # Q/A: 调整世界坐标系 roll (绕世界 X 轴)
         if event.key == pygame.K_q:
-            self.module2_world_roll += step
+            self.world_roll[world_idx] += step
             self._apply_world_orientation()
             self._print_current_state()
         elif event.key == pygame.K_a:
-            self.module2_world_roll -= step
+            self.world_roll[world_idx] -= step
             self._apply_world_orientation()
             self._print_current_state()
         
         # W/S: 调整世界坐标系 pitch (绕世界 Y 轴)
         elif event.key == pygame.K_w:
-            self.module2_world_pitch += step
+            self.world_pitch[world_idx] += step
             self._apply_world_orientation()
             self._print_current_state()
         elif event.key == pygame.K_s:
-            self.module2_world_pitch -= step
+            self.world_pitch[world_idx] -= step
             self._apply_world_orientation()
             self._print_current_state()
     
-    def _apply_world_orientation(self):
-        """应用第二节的世界坐标系目标姿态"""
-        # 从世界坐标系欧拉角创建四元数
-        # 注意：PCC 模型不能产生 yaw，所以只用 roll 和 pitch
-        q = quaternion_from_euler(self.module2_world_roll, self.module2_world_pitch, 0)
+    def _apply_world_orientation(self, module_idx=None):
+        """应用指定模块的世界坐标系目标姿态"""
+        if module_idx is None:
+            module_idx = self.robot.active_module
         
-        # 设置第二节的世界坐标系姿态
-        arc_length = self.robot.modules[1].arc_length
-        self.robot.set_module_world_orientation(1, q, arc_length)
+        if module_idx == 0:
+            return  # 第一节不用世界坐标系
+        
+        # 获取该模块的世界坐标系目标角度（索引从 0 开始，对应第 2、3、4 节）
+        world_idx = module_idx - 1
+        roll = self.world_roll[world_idx]
+        pitch = self.world_pitch[world_idx]
+        
+        # 从世界坐标系欧拉角创建四元数
+        q = quaternion_from_euler(roll, pitch, 0)
+        
+        # 设置该模块的世界坐标系姿态
+        arc_length = self.robot.modules[module_idx].arc_length
+        self.robot.set_module_world_orientation(module_idx, q, arc_length)
     
     def _print_current_state(self):
         """打印当前状态信息"""
@@ -1290,13 +1307,14 @@ class Renderer:
         print(f"    θ_bend = {math.degrees(module.theta_bend):.1f}°")
         print(f"    弧长 = {module.arc_length:.1f} cm")
         
-        if module_idx == 1:
+        if module_idx > 0:
+            world_idx = module_idx - 1
             print(f"  世界坐标系目标:")
-            print(f"    Roll = {math.degrees(self.module2_world_roll):.1f}°")
-            print(f"    Pitch = {math.degrees(self.module2_world_pitch):.1f}°")
+            print(f"    Roll = {math.degrees(self.world_roll[world_idx]):.1f}°")
+            print(f"    Pitch = {math.degrees(self.world_pitch[world_idx]):.1f}°")
             
             # 显示实际末端姿态
-            q = self.robot.get_module_world_orientation(1)
+            q = self.robot.get_module_world_orientation(module_idx)
             R = quaternion_to_rotation_matrix(q)
             # 末端法向量（Z 轴）
             normal = R @ np.array([0, 0, -1])
@@ -1318,8 +1336,10 @@ class Renderer:
                     # 重置所有模块
                     for m in self.robot.modules:
                         m.set_pcc_params(0, 0, DEFAULT_ARC_LENGTH)
-                    self.module2_world_roll = 0.0
-                    self.module2_world_pitch = 0.0
+                    # 重置所有世界坐标系角度
+                    for i in range(len(self.world_roll)):
+                        self.world_roll[i] = 0.0
+                        self.world_pitch[i] = 0.0
                     self.robot._update_chain()
                 
                 # 切换活动模块 (TAB)
@@ -1354,45 +1374,50 @@ class Renderer:
                     self.show_perpendicularity_check = not self.show_perpendicularity_check
                 
                 # 预设姿态（应用于当前模块）
-                # 第一节：局部坐标系，第二节：世界坐标系
+                # 第一节：局部坐标系，其他节：世界坐标系
                 elif event.key == pygame.K_1:
                     if module_idx == 0:
                         module.set_pcc_params(0, math.radians(25), module.arc_length)
                     else:
-                        self.module2_world_roll = math.radians(25)
-                        self.module2_world_pitch = 0
+                        world_idx = module_idx - 1
+                        self.world_roll[world_idx] = math.radians(25)
+                        self.world_pitch[world_idx] = 0
                         self._apply_world_orientation()
                     self.robot._update_chain()
                 elif event.key == pygame.K_2:
                     if module_idx == 0:
                         module.set_pcc_params(math.pi, math.radians(25), module.arc_length)
                     else:
-                        self.module2_world_roll = -math.radians(25)
-                        self.module2_world_pitch = 0
+                        world_idx = module_idx - 1
+                        self.world_roll[world_idx] = -math.radians(25)
+                        self.world_pitch[world_idx] = 0
                         self._apply_world_orientation()
                     self.robot._update_chain()
                 elif event.key == pygame.K_3:
                     if module_idx == 0:
                         module.set_pcc_params(math.pi/2, math.radians(25), module.arc_length)
                     else:
-                        self.module2_world_roll = 0
-                        self.module2_world_pitch = math.radians(25)
+                        world_idx = module_idx - 1
+                        self.world_roll[world_idx] = 0
+                        self.world_pitch[world_idx] = math.radians(25)
                         self._apply_world_orientation()
                     self.robot._update_chain()
                 elif event.key == pygame.K_4:
                     if module_idx == 0:
                         module.set_pcc_params(-math.pi/2, math.radians(25), module.arc_length)
                     else:
-                        self.module2_world_roll = 0
-                        self.module2_world_pitch = -math.radians(25)
+                        world_idx = module_idx - 1
+                        self.world_roll[world_idx] = 0
+                        self.world_pitch[world_idx] = -math.radians(25)
                         self._apply_world_orientation()
                     self.robot._update_chain()
                 elif event.key == pygame.K_5:
                     if module_idx == 0:
                         module.set_pcc_params(math.pi/4, math.radians(25), module.arc_length)
                     else:
-                        self.module2_world_roll = math.radians(15)
-                        self.module2_world_pitch = math.radians(15)
+                        world_idx = module_idx - 1
+                        self.world_roll[world_idx] = math.radians(15)
+                        self.world_pitch[world_idx] = math.radians(15)
                         self._apply_world_orientation()
                     self.robot._update_chain()
             
