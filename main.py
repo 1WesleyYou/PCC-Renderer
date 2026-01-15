@@ -72,6 +72,149 @@ def rotation_matrix_axis_angle(axis, angle):
     return R
 
 
+# ============================================================
+# 四元数工具函数
+# ============================================================
+
+def quaternion_from_euler(roll, pitch, yaw):
+    """
+    从欧拉角创建四元数 (w, x, y, z)
+    roll: 绕 X 轴
+    pitch: 绕 Y 轴  
+    yaw: 绕 Z 轴
+    """
+    cr, sr = math.cos(roll/2), math.sin(roll/2)
+    cp, sp = math.cos(pitch/2), math.sin(pitch/2)
+    cy, sy = math.cos(yaw/2), math.sin(yaw/2)
+    
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    
+    return np.array([w, x, y, z])
+
+
+def quaternion_to_rotation_matrix(q):
+    """
+    四元数转旋转矩阵
+    q: (w, x, y, z)
+    """
+    w, x, y, z = q
+    
+    # 归一化
+    norm = math.sqrt(w*w + x*x + y*y + z*z)
+    if norm < 1e-10:
+        return np.eye(3)
+    w, x, y, z = w/norm, x/norm, y/norm, z/norm
+    
+    R = np.array([
+        [1 - 2*(y*y + z*z), 2*(x*y - w*z), 2*(x*z + w*y)],
+        [2*(x*y + w*z), 1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+        [2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x*x + y*y)]
+    ])
+    return R
+
+
+def rotation_matrix_to_quaternion(R):
+    """
+    旋转矩阵转四元数 (w, x, y, z)
+    """
+    trace = R[0,0] + R[1,1] + R[2,2]
+    
+    if trace > 0:
+        s = 0.5 / math.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (R[2,1] - R[1,2]) * s
+        y = (R[0,2] - R[2,0]) * s
+        z = (R[1,0] - R[0,1]) * s
+    elif R[0,0] > R[1,1] and R[0,0] > R[2,2]:
+        s = 2.0 * math.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2])
+        w = (R[2,1] - R[1,2]) / s
+        x = 0.25 * s
+        y = (R[0,1] + R[1,0]) / s
+        z = (R[0,2] + R[2,0]) / s
+    elif R[1,1] > R[2,2]:
+        s = 2.0 * math.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2])
+        w = (R[0,2] - R[2,0]) / s
+        x = (R[0,1] + R[1,0]) / s
+        y = 0.25 * s
+        z = (R[1,2] + R[2,1]) / s
+    else:
+        s = 2.0 * math.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1])
+        w = (R[1,0] - R[0,1]) / s
+        x = (R[0,2] + R[2,0]) / s
+        y = (R[1,2] + R[2,1]) / s
+        z = 0.25 * s
+    
+    return np.array([w, x, y, z])
+
+
+def quaternion_multiply(q1, q2):
+    """
+    四元数乘法 q1 * q2
+    """
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    
+    w = w1*w2 - x1*x2 - y1*y2 - z1*z2
+    x = w1*x2 + x1*w2 + y1*z2 - z1*y2
+    y = w1*y2 - x1*z2 + y1*w2 + z1*x2
+    z = w1*z2 + x1*y2 - y1*x2 + z1*w2
+    
+    return np.array([w, x, y, z])
+
+
+def quaternion_conjugate(q):
+    """四元数共轭"""
+    return np.array([q[0], -q[1], -q[2], -q[3]])
+
+
+def rotation_matrix_to_pcc_params(R_target, R_base):
+    """
+    从目标旋转矩阵（世界坐标系）计算相对于基座的 PCC 参数
+    
+    PCC 约束：
+    - 末端法向量由弯曲决定
+    - 末端 Z 轴（法向量）= R_base @ R_local @ [0,0,-1]
+    - R_local 只能是绕某个水平轴旋转（弯曲）
+    
+    参数:
+        R_target: 目标末端旋转矩阵（世界坐标系）
+        R_base: 当前节基座的旋转矩阵（世界坐标系）
+    
+    返回:
+        phi: 弯曲方向角
+        theta_bend: 弯曲角度
+    """
+    # 计算相对旋转：R_relative = R_base^T @ R_target
+    R_relative = R_base.T @ R_target
+    
+    # 目标末端法向量（在基座局部坐标系中）
+    # 初始法向量是 [0, 0, -1]，旋转后是 R_relative @ [0, 0, -1]
+    target_normal_local = R_relative @ np.array([0, 0, -1])
+    
+    # 在 PCC 模型中，弯曲后的法向量在 XZ 平面内旋转（取决于 phi）
+    # 法向量 = [sin(theta)*cos(phi), sin(theta)*sin(phi), -cos(theta)]
+    # 其中 theta = theta_bend
+    
+    # 从目标法向量提取 phi 和 theta_bend
+    nx, ny, nz = target_normal_local
+    
+    # theta_bend = arccos(-nz)，因为 nz = -cos(theta_bend)
+    # 限制在有效范围内
+    nz_clamped = np.clip(nz, -1, 1)
+    theta_bend = math.acos(-nz_clamped)
+    
+    # phi = atan2(ny, nx)，因为 nx = sin(theta)*cos(phi), ny = sin(theta)*sin(phi)
+    if theta_bend > 1e-6:
+        phi = math.atan2(ny, nx)
+    else:
+        phi = 0  # 无弯曲时 phi 无意义
+    
+    return phi, theta_bend
+
+
 def get_equilateral_triangle_vertices(side_length, center=np.array([0, 0, 0])):
     """
     获取正三角形顶点坐标
@@ -248,19 +391,17 @@ class PCCForwardKinematics:
         """
         获取特定 actuator 弧形上的点
         
-        严格等曲率圆弧模型：
-        1. 所有 actuator 曲率相同 κ
-        2. 起点切线垂直于固定端板
-        3. 终点切线垂直于自由端板（自动满足，因为同心圆弧）
-        4. 三角形会变形（物理必然）
-        
-        每个 actuator 的弯曲平面包含：起点、起点切线、和弯曲方向
+        同心圆弧模型：
+        - 所有圆弧共享同一个曲率中心
+        - 每个 actuator 有不同的弯曲半径
+        - 所有圆弧弯曲相同的角度 theta_bend
+        - 两端都垂直于板
         """
         kappa = fk_result['kappa']
         phi = fk_result['phi']
         theta_bend = fk_result['theta_bend']
+        s = fk_result['s']
         actuator_angle = self.actuator_angles[actuator_index]
-        actuator_length = fk_result['actuator_lengths'][actuator_index]
         
         # 起点（固定端三角形顶点）
         P0 = np.array([
@@ -275,45 +416,35 @@ class PCCForwardKinematics:
             # 直线情况
             for i in range(1, num_segments + 1):
                 t = i / num_segments
-                z = -t * actuator_length
+                z = -t * s
                 points.append(np.array([P0[0], P0[1], z]))
             return points
         
-        # 该 actuator 的弯曲半径
-        # R_i = l_i / theta_bend（因为弧长 = 半径 × 角度）
-        R_act = actuator_length / theta_bend
+        # 中心线的弯曲半径
+        R_center = s / theta_bend
         
-        # 弯曲轴（所有 actuator 共享同一弯曲轴，垂直于弯曲方向）
+        # 弯曲方向和轴
+        bend_dir = np.array([math.cos(phi), math.sin(phi), 0])
         bend_axis = np.array([-math.sin(phi), math.cos(phi), 0])
         
-        # 起点切线方向（垂直于固定端板，向下）
-        T0 = np.array([0, 0, -1])
-        
-        # 圆心位置：从起点沿垂直于切线的方向偏移 R_act
-        # 垂直于 T0 且在弯曲平面内的方向
-        # 弯曲平面由 T0 和弯曲方向定义
-        bend_dir = np.array([math.cos(phi), math.sin(phi), 0])
-        
-        # 圆心方向（垂直于 T0，在弯曲方向上）
-        # 对于向 phi 方向弯曲，圆心在 -bend_dir 方向
-        center_dir = -bend_dir
-        
-        # 圆心位置
-        center = P0 + R_act * center_dir
+        # 共同的曲率中心（在原点沿 -bend_dir 方向偏移 R_center）
+        center = -R_center * bend_dir
         
         # 生成圆弧点
         for i in range(1, num_segments + 1):
             t = i / num_segments
             angle = t * theta_bend
             
-            # 从起点绕弯曲轴旋转
-            # 起点相对于圆心的向量
+            # 旋转矩阵（绕弯曲轴旋转）
+            rot = rotation_matrix_axis_angle(bend_axis, angle)
+            
+            # 起点相对于曲率中心的向量
             v0 = P0 - center
             
-            # 绕弯曲轴旋转 angle
-            rot = rotation_matrix_axis_angle(bend_axis, angle)
+            # 旋转后的向量
             v = rot @ v0
             
+            # 新的点
             point = center + v
             points.append(point)
         
@@ -376,20 +507,19 @@ class PCCForwardKinematics:
 
 
 # ============================================================
-# 软体机械臂类
+# PCC 模块类（单节机械臂）
 # ============================================================
 
-class SoftRobotArm:
+class PCCModule:
     """
-    软体机械臂类（倒挂配置）
+    PCC 模块（单节机械臂）
     
-    使用正确的 PCC 参数：
-    - phi: 弯曲方向
-    - theta_bend: 弯曲角度
-    - arc_length: 弧长
+    每个模块有自己的 PCC 参数和几何状态
+    可以指定基座的位置和姿态
     """
     
-    def __init__(self):
+    def __init__(self, module_id=0):
+        self.module_id = module_id
         self.fk = PCCForwardKinematics(TRIANGLE_SIDE)
         
         # PCC 参数
@@ -397,12 +527,19 @@ class SoftRobotArm:
         self.theta_bend = 0.0       # 弯曲角度
         self.arc_length = DEFAULT_ARC_LENGTH
         
-        # 更直观的控制：倾斜角度
-        self.tilt_x = 0.0  # X 方向倾斜
-        self.tilt_y = 0.0  # Y 方向倾斜
+        # 基座变换（用于多节连接）
+        self.base_position = np.array([0.0, 0.0, 0.0])
+        self.base_rotation = np.eye(3)
         
-        # 固定端位置
-        self.fixed_z = 0.0
+        # 几何数据
+        self.pcc_result = None
+        self.fixed_vertices_top = []
+        self.fixed_vertices_bottom = []
+        self.free_vertices_top = []
+        self.free_vertices_bottom = []
+        self.actuator_arcs = []
+        self.center_arc = []
+        self.end_tangent = np.array([0, 0, -1])
         
         self._update_geometry()
     
@@ -411,31 +548,31 @@ class SoftRobotArm:
         self.phi = phi
         self.theta_bend = max(0, min(MAX_BEND_ANGLE, theta_bend))
         self.arc_length = max(ACTUATOR_MIN, min(ACTUATOR_MAX, arc_length))
-        
-        # 更新 tilt 值以保持同步
-        self.tilt_x = self.theta_bend * math.cos(self.phi)
-        self.tilt_y = self.theta_bend * math.sin(self.phi)
-        
         self._update_geometry()
     
-    def set_tilt(self, tilt_x, tilt_y):
-        """使用倾斜角度设置姿态"""
-        self.tilt_x = tilt_x
-        self.tilt_y = tilt_y
-        
-        # 转换为 PCC 参数
-        self.theta_bend = math.sqrt(tilt_x**2 + tilt_y**2)
-        self.theta_bend = min(self.theta_bend, MAX_BEND_ANGLE)
-        
-        if self.theta_bend > 1e-6:
-            self.phi = math.atan2(tilt_y, tilt_x)
-        
+    def set_base_transform(self, position, rotation):
+        """设置基座变换（用于多节连接）"""
+        self.base_position = np.array(position)
+        self.base_rotation = np.array(rotation)
         self._update_geometry()
     
-    def set_arc_length(self, s):
-        """设置弧长"""
-        self.arc_length = max(ACTUATOR_MIN, min(ACTUATOR_MAX, s))
-        self._update_geometry()
+    def get_end_transform(self):
+        """获取末端变换（用于连接下一节）"""
+        if self.pcc_result is None:
+            return self.base_position.copy(), self.base_rotation.copy()
+        
+        # 末端位置：自由端三角形中心
+        end_pos = np.mean(self.free_vertices_bottom, axis=0)
+        
+        # 末端旋转：基座旋转 @ 本节的旋转
+        local_rotation = self.pcc_result['end_rotation']
+        end_rotation = self.base_rotation @ local_rotation
+        
+        return end_pos, end_rotation
+    
+    def _transform_point(self, local_point):
+        """将局部坐标转换为全局坐标"""
+        return self.base_position + self.base_rotation @ local_point
     
     def _update_geometry(self):
         """更新几何状态"""
@@ -443,47 +580,274 @@ class SoftRobotArm:
             self.phi, self.theta_bend, self.arc_length
         )
         
-        # 固定端三棱柱
-        # 顶面在 z=0，底面在 z=-TRIANGLE_THICKNESS
-        self.fixed_vertices_top = get_equilateral_triangle_vertices(
-            TRIANGLE_SIDE, center=np.array([0, 0, self.fixed_z])
+        # 局部坐标系中的固定端三棱柱
+        fixed_top_local = get_equilateral_triangle_vertices(
+            TRIANGLE_SIDE, center=np.array([0, 0, 0])
         )
-        self.fixed_vertices_bottom = get_equilateral_triangle_vertices(
-            TRIANGLE_SIDE, center=np.array([0, 0, self.fixed_z - TRIANGLE_THICKNESS])
+        fixed_bottom_local = get_equilateral_triangle_vertices(
+            TRIANGLE_SIDE, center=np.array([0, 0, -TRIANGLE_THICKNESS])
         )
         
-        # 计算中心线和 Actuator 弧线
-        center_arc_raw = self.fk.get_center_arc_points(self.pcc_result)
-        self.center_arc = [pt - np.array([0, 0, TRIANGLE_THICKNESS]) for pt in center_arc_raw]
+        # 转换到全局坐标
+        self.fixed_vertices_top = [self._transform_point(v) for v in fixed_top_local]
+        self.fixed_vertices_bottom = [self._transform_point(v) for v in fixed_bottom_local]
         
-        self.actuator_arcs = []
+        # 计算 Actuator 弧线（局部坐标，从 z=0 开始）
+        local_actuator_arcs = []
         for i in range(3):
             arc = self.fk.get_actuator_arc_points(self.pcc_result, i)
-            adjusted_arc = [pt - np.array([0, 0, TRIANGLE_THICKNESS]) for pt in arc]
-            self.actuator_arcs.append(adjusted_arc)
+            # 不调整，从 z=0 开始（与中心线一致）
+            local_actuator_arcs.append(arc)
         
-        # 自由端三角形顶点 = 圆弧终点（三角形会变形，这是物理必然）
+        # 转换到全局坐标
+        self.actuator_arcs = []
+        for arc in local_actuator_arcs:
+            global_arc = [self._transform_point(pt) for pt in arc]
+            self.actuator_arcs.append(global_arc)
+        
+        # 中心线（从固定端顶面开始，即 base_position，与 actuator 一致）
+        center_arc_local = self.fk.get_center_arc_points(self.pcc_result)
+        self.center_arc = [self._transform_point(pt) for pt in center_arc_local]
+        
+        # 自由端三角形顶点 = 圆弧终点
         self.free_vertices_top = []
         for i in range(3):
             top_vertex = self.actuator_arcs[i][-1].copy()
             self.free_vertices_top.append(top_vertex)
         
-        # 板的法向量：所有 actuator 终点切线相同（同心圆弧特性）
-        # 使用第一个 actuator 的终点切线
+        # 板的法向量
         arc = self.actuator_arcs[0]
         if len(arc) >= 2:
             tangent = np.array(arc[-1]) - np.array(arc[-2])
-            tangent = tangent / np.linalg.norm(tangent)
-            self.end_tangent = tangent
+            norm = np.linalg.norm(tangent)
+            if norm > 1e-10:
+                self.end_tangent = tangent / norm
+            else:
+                self.end_tangent = self.base_rotation @ np.array([0, 0, -1])
         else:
-            self.end_tangent = self.pcc_result['end_normal']
+            self.end_tangent = self.base_rotation @ np.array([0, 0, -1])
         
-        # 自由端底面顶点 = 顶面顶点沿法向量方向偏移
+        # 自由端底面顶点
         self.free_vertices_bottom = []
         for i in range(3):
             top_vertex = self.free_vertices_top[i]
             bottom_vertex = top_vertex + self.end_tangent * TRIANGLE_THICKNESS
             self.free_vertices_bottom.append(bottom_vertex)
+        
+        # 重新计算中心线：使用与 actuator 相同的旋转方法
+        # 中心线从固定端底面中心开始
+        fixed_bottom_center = np.mean(self.fixed_vertices_bottom, axis=0)
+        free_bottom_center = np.mean(self.free_vertices_bottom, axis=0)
+        
+        kappa = self.pcc_result['kappa']
+        theta_bend = self.pcc_result['theta_bend']
+        phi = self.pcc_result['phi']
+        s = self.pcc_result['s']
+        
+        self.center_arc = []
+        num_segments = ARC_SEGMENTS
+        
+        if kappa < 1e-6:
+            # 直线情况：从基座位置到自由端底面中心
+            start_pt = self.base_position.copy()
+            for i in range(num_segments + 1):
+                t = i / num_segments
+                pt = start_pt + t * (free_bottom_center - start_pt)
+                self.center_arc.append(pt)
+        else:
+            R_center = s / theta_bend
+            
+            # 弯曲方向和轴（局部坐标）
+            bend_dir = np.array([math.cos(phi), math.sin(phi), 0])
+            bend_axis = np.array([-math.sin(phi), math.cos(phi), 0])
+            
+            # 曲率中心（局部坐标，在原点沿 -bend_dir 方向偏移 R_center）
+            local_center = -R_center * bend_dir
+            
+            # 中心线起点（局部坐标，基座位置=固定端顶面中心）
+            local_P0 = np.array([0, 0, 0])
+            
+            # 中心线弧长（从固定端底面到自由端底面）
+            # 包括弧长 s + 两块板的厚度
+            total_theta = theta_bend  # 基本弯曲角度
+            
+            for i in range(num_segments + 1):
+                t = i / num_segments
+                angle = t * total_theta
+                
+                # 旋转矩阵
+                rot = rotation_matrix_axis_angle(bend_axis, angle)
+                
+                # 起点相对于曲率中心的向量
+                v0 = local_P0 - local_center
+                
+                # 旋转后的向量
+                v = rot @ v0
+                
+                # 新的点（局部坐标）
+                local_pt = local_center + v
+                
+                # 转换到全局坐标
+                global_pt = self._transform_point(local_pt)
+                self.center_arc.append(global_pt)
+            
+            # 平滑插值延伸到自由端底面中心
+            if len(self.center_arc) >= 2:
+                last_pt = np.array(self.center_arc[-1])
+                
+                # 计算到自由端底面中心的距离
+                dist = np.linalg.norm(free_bottom_center - last_pt)
+                
+                # 线性插值到 free_bottom_center
+                num_extend = max(1, int(dist / 2))  # 每 2cm 一个点
+                for i in range(1, num_extend + 1):
+                    t = i / num_extend
+                    extend_pt = last_pt + t * (free_bottom_center - last_pt)
+                    self.center_arc.append(extend_pt)
+            
+
+
+# ============================================================
+# 多节软体机械臂类
+# ============================================================
+
+class SoftRobotArm:
+    """
+    多节软体机械臂类（倒挂配置）
+    
+    由多个 PCCModule 串联组成
+    """
+    
+    def __init__(self, num_modules=2):
+        self.num_modules = num_modules
+        self.modules = []
+        
+        for i in range(num_modules):
+            module = PCCModule(module_id=i)
+            self.modules.append(module)
+        
+        # 当前选中的模块（用于控制）
+        self.active_module = 0
+        
+        self._update_chain()
+    
+    def _update_chain(self):
+        """更新模块链的变换"""
+        for i, module in enumerate(self.modules):
+            if i == 0:
+                # 第一节：基座在原点
+                module.set_base_transform(
+                    np.array([0.0, 0.0, 0.0]),
+                    np.eye(3)
+                )
+            else:
+                # 后续节：基座连接到前一节的末端
+                prev_end_pos, prev_end_rot = self.modules[i-1].get_end_transform()
+                module.set_base_transform(prev_end_pos, prev_end_rot)
+    
+    def set_module_params(self, module_idx, phi, theta_bend, arc_length):
+        """设置指定模块的 PCC 参数"""
+        if 0 <= module_idx < self.num_modules:
+            self.modules[module_idx].set_pcc_params(phi, theta_bend, arc_length)
+            # 更新后续模块的变换
+            self._update_chain()
+    
+    def set_pcc_params(self, phi, theta_bend, arc_length):
+        """设置当前活动模块的 PCC 参数（兼容旧接口）"""
+        self.set_module_params(self.active_module, phi, theta_bend, arc_length)
+    
+    def set_all_modules_params(self, phi, theta_bend, arc_length):
+        """设置所有模块相同的 PCC 参数"""
+        for i in range(self.num_modules):
+            self.modules[i].phi = phi
+            self.modules[i].theta_bend = max(0, min(MAX_BEND_ANGLE, theta_bend))
+            self.modules[i].arc_length = max(ACTUATOR_MIN, min(ACTUATOR_MAX, arc_length))
+        self._update_chain()
+    
+    def set_module_world_orientation(self, module_idx, target_quaternion, arc_length=None):
+        """
+        使用世界坐标系的绝对姿态设置指定模块
+        
+        参数:
+            module_idx: 模块索引
+            target_quaternion: 目标四元数 (w, x, y, z)，世界坐标系
+            arc_length: 弧长，如果为 None 则保持当前值
+        """
+        if module_idx < 0 or module_idx >= self.num_modules:
+            return
+        
+        # 首先更新链以获取正确的基座变换
+        self._update_chain()
+        
+        # 获取该模块的基座旋转矩阵
+        R_base = self.modules[module_idx].base_rotation
+        
+        # 目标旋转矩阵（世界坐标系）
+        R_target = quaternion_to_rotation_matrix(target_quaternion)
+        
+        # 计算相对于基座的 PCC 参数
+        phi, theta_bend = rotation_matrix_to_pcc_params(R_target, R_base)
+        
+        # 限制 theta_bend 在有效范围内
+        theta_bend = max(0, min(MAX_BEND_ANGLE, theta_bend))
+        
+        # 设置弧长
+        if arc_length is None:
+            arc_length = self.modules[module_idx].arc_length
+        
+        # 设置参数
+        self.modules[module_idx].set_pcc_params(phi, theta_bend, arc_length)
+        
+        # 更新后续模块
+        self._update_chain()
+    
+    def set_module_world_euler(self, module_idx, roll, pitch, yaw, arc_length=None):
+        """
+        使用世界坐标系的欧拉角设置指定模块
+        
+        参数:
+            module_idx: 模块索引
+            roll: 绕 X 轴旋转角度 (弧度)
+            pitch: 绕 Y 轴旋转角度 (弧度)
+            yaw: 绕 Z 轴旋转角度 (弧度)
+            arc_length: 弧长
+        """
+        q = quaternion_from_euler(roll, pitch, yaw)
+        self.set_module_world_orientation(module_idx, q, arc_length)
+    
+    def get_module_world_orientation(self, module_idx):
+        """
+        获取指定模块末端的世界坐标系姿态
+        
+        返回:
+            四元数 (w, x, y, z)
+        """
+        if module_idx < 0 or module_idx >= self.num_modules:
+            return np.array([1, 0, 0, 0])
+        
+        _, end_rot = self.modules[module_idx].get_end_transform()
+        return rotation_matrix_to_quaternion(end_rot)
+    
+    def get_end_effector_world_orientation(self):
+        """获取末端执行器的世界坐标系姿态"""
+        return self.get_module_world_orientation(self.num_modules - 1)
+    
+    # 兼容旧接口的属性
+    @property
+    def pcc_result(self):
+        return self.modules[self.active_module].pcc_result
+    
+    @property
+    def phi(self):
+        return self.modules[self.active_module].phi
+    
+    @property
+    def theta_bend(self):
+        return self.modules[self.active_module].theta_bend
+    
+    @property
+    def arc_length(self):
+        return self.modules[self.active_module].arc_length
 
 
 # ============================================================
@@ -496,7 +860,7 @@ class Renderer:
     def __init__(self):
         pygame.init()
         pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT), DOUBLEBUF | OPENGL)
-        pygame.display.set_caption("软体机械臂 PCC 模型 - 倒挂配置 (正确约束)")
+        pygame.display.set_caption("多节软体机械臂 PCC 模型 - 倒挂配置")
         
         self._setup_opengl()
         
@@ -512,6 +876,12 @@ class Renderer:
         self.show_center_line = True
         self.show_mount = True
         self.show_perpendicularity_check = False
+        
+        # 第二节世界坐标系姿态控制
+        # 存储目标欧拉角（世界坐标系）
+        self.module2_world_roll = 0.0    # 绕世界 X 轴
+        self.module2_world_pitch = 0.0   # 绕世界 Y 轴
+        # 注意：PCC 不能产生 yaw，所以不存储 yaw
     
     def _setup_opengl(self):
         glEnable(GL_DEPTH_TEST)
@@ -765,52 +1135,172 @@ class Renderer:
         glDisable(GL_LIGHTING)
         glLineWidth(2.0)
         
-        # 固定端法向量（向下）
-        glColor4f(1.0, 1.0, 0.0, 1.0)
-        glBegin(GL_LINES)
-        glVertex3f(0, -TRIANGLE_THICKNESS, 0)
-        glVertex3f(0, -TRIANGLE_THICKNESS - 15, 0)
-        glEnd()
-        
-        # 自由端法向量
-        end_center = self.robot.pcc_result['end_center']
-        end_normal = self.robot.pcc_result['end_normal']
-        start = self._to_gl_coords(end_center - np.array([0, 0, TRIANGLE_THICKNESS]))
-        end_pt = end_center - np.array([0, 0, TRIANGLE_THICKNESS]) + end_normal * 15
-        end_gl = self._to_gl_coords(end_pt)
-        
-        glColor4f(1.0, 0.5, 0.0, 1.0)
-        glBegin(GL_LINES)
-        glVertex3f(*start)
-        glVertex3f(*end_gl)
-        glEnd()
+        # 为每个模块绘制末端法向量
+        for i, module in enumerate(self.robot.modules):
+            if module.pcc_result is None:
+                continue
+            
+            # 末端中心
+            end_center = np.mean(module.free_vertices_top, axis=0)
+            end_normal = module.end_tangent
+            
+            start = self._to_gl_coords(end_center)
+            end_pt = end_center + end_normal * 15
+            end_gl = self._to_gl_coords(end_pt)
+            
+            # 不同模块用不同颜色
+            if i == 0:
+                glColor4f(1.0, 1.0, 0.0, 1.0)
+            else:
+                glColor4f(1.0, 0.5, 0.0, 1.0)
+            
+            glBegin(GL_LINES)
+            glVertex3f(*start)
+            glVertex3f(*end_gl)
+            glEnd()
         
         glLineWidth(1.0)
         glEnable(GL_LIGHTING)
     
-    def _draw_robot(self):
+    def _draw_module(self, module, is_first=False, is_active=False):
+        """绘制单个模块"""
+        # 固定端颜色：第一节用蓝色，其他用灰色
+        if is_first:
+            fixed_color = COLOR_TRIANGLE_FIXED
+        else:
+            fixed_color = (0.5, 0.5, 0.6, 0.85)  # 中间连接板用灰色
+        
+        # 自由端颜色：活动模块用橙色，否则用较暗的橙色
+        if is_active:
+            free_color = COLOR_TRIANGLE_FREE
+        else:
+            free_color = (0.7, 0.35, 0.2, 0.85)
+        
+        # 绘制固定端三棱柱（每个模块都要画）
         self._draw_triangular_prism(
-            self.robot.fixed_vertices_bottom,
-            self.robot.fixed_vertices_top,
-            COLOR_TRIANGLE_FIXED,
+            module.fixed_vertices_bottom,
+            module.fixed_vertices_top,
+            fixed_color,
             COLOR_TRIANGLE_SIDE
         )
         
+        # 绘制自由端三棱柱
         self._draw_triangular_prism(
-            self.robot.free_vertices_bottom,
-            self.robot.free_vertices_top,
-            COLOR_TRIANGLE_FREE,
+            module.free_vertices_bottom,
+            module.free_vertices_top,
+            free_color,
             COLOR_TRIANGLE_SIDE
         )
         
+        # 绘制 actuator
         colors = [COLOR_ACTUATOR_0, COLOR_ACTUATOR_1, COLOR_ACTUATOR_2]
         for i in range(3):
-            self._draw_actuator_tube(self.robot.actuator_arcs[i], colors[i], radius=0.8)
+            self._draw_actuator_tube(module.actuator_arcs[i], colors[i], radius=0.8)
         
+        # 绘制中心线
         if self.show_center_line:
-            self._draw_center_line(self.robot.center_arc, COLOR_CENTER_LINE, line_width=3.0)
+            self._draw_center_line(module.center_arc, COLOR_CENTER_LINE, line_width=3.0)
+    
+    def _draw_robot(self):
+        """绘制整个机器人（所有模块）"""
+        for i, module in enumerate(self.robot.modules):
+            is_first = (i == 0)
+            is_active = (i == self.robot.active_module)
+            self._draw_module(module, is_first=is_first, is_active=is_active)
         
         self._draw_normal_arrows()
+    
+    def _get_active_module(self):
+        """获取当前活动模块"""
+        return self.robot.modules[self.robot.active_module]
+    
+    def _handle_local_control(self, event, module, step):
+        """处理局部坐标系控制（相对于基座）"""
+        # Tilt X 控制 (Q/A) - 向 X 方向弯曲
+        if event.key == pygame.K_q:
+            tilt_x = module.theta_bend * math.cos(module.phi) + step
+            tilt_y = module.theta_bend * math.sin(module.phi)
+            new_theta = math.sqrt(tilt_x**2 + tilt_y**2)
+            new_phi = math.atan2(tilt_y, tilt_x) if new_theta > 1e-6 else 0
+            module.set_pcc_params(new_phi, new_theta, module.arc_length)
+            self.robot._update_chain()
+        elif event.key == pygame.K_a:
+            tilt_x = module.theta_bend * math.cos(module.phi) - step
+            tilt_y = module.theta_bend * math.sin(module.phi)
+            new_theta = math.sqrt(tilt_x**2 + tilt_y**2)
+            new_phi = math.atan2(tilt_y, tilt_x) if new_theta > 1e-6 else 0
+            module.set_pcc_params(new_phi, new_theta, module.arc_length)
+            self.robot._update_chain()
+        
+        # Tilt Y 控制 (W/S) - 向 Y 方向弯曲
+        elif event.key == pygame.K_w:
+            tilt_x = module.theta_bend * math.cos(module.phi)
+            tilt_y = module.theta_bend * math.sin(module.phi) + step
+            new_theta = math.sqrt(tilt_x**2 + tilt_y**2)
+            new_phi = math.atan2(tilt_y, tilt_x) if new_theta > 1e-6 else 0
+            module.set_pcc_params(new_phi, new_theta, module.arc_length)
+            self.robot._update_chain()
+        elif event.key == pygame.K_s:
+            tilt_x = module.theta_bend * math.cos(module.phi)
+            tilt_y = module.theta_bend * math.sin(module.phi) - step
+            new_theta = math.sqrt(tilt_x**2 + tilt_y**2)
+            new_phi = math.atan2(tilt_y, tilt_x) if new_theta > 1e-6 else 0
+            module.set_pcc_params(new_phi, new_theta, module.arc_length)
+            self.robot._update_chain()
+    
+    def _handle_world_control(self, event, step):
+        """处理第二节世界坐标系控制"""
+        # Q/A: 调整世界坐标系 roll (绕世界 X 轴)
+        if event.key == pygame.K_q:
+            self.module2_world_roll += step
+            self._apply_world_orientation()
+            self._print_current_state()
+        elif event.key == pygame.K_a:
+            self.module2_world_roll -= step
+            self._apply_world_orientation()
+            self._print_current_state()
+        
+        # W/S: 调整世界坐标系 pitch (绕世界 Y 轴)
+        elif event.key == pygame.K_w:
+            self.module2_world_pitch += step
+            self._apply_world_orientation()
+            self._print_current_state()
+        elif event.key == pygame.K_s:
+            self.module2_world_pitch -= step
+            self._apply_world_orientation()
+            self._print_current_state()
+    
+    def _apply_world_orientation(self):
+        """应用第二节的世界坐标系目标姿态"""
+        # 从世界坐标系欧拉角创建四元数
+        # 注意：PCC 模型不能产生 yaw，所以只用 roll 和 pitch
+        q = quaternion_from_euler(self.module2_world_roll, self.module2_world_pitch, 0)
+        
+        # 设置第二节的世界坐标系姿态
+        arc_length = self.robot.modules[1].arc_length
+        self.robot.set_module_world_orientation(1, q, arc_length)
+    
+    def _print_current_state(self):
+        """打印当前状态信息"""
+        module_idx = self.robot.active_module
+        module = self.robot.modules[module_idx]
+        
+        print(f"  模块 {module_idx + 1}:")
+        print(f"    φ = {math.degrees(module.phi):.1f}°")
+        print(f"    θ_bend = {math.degrees(module.theta_bend):.1f}°")
+        print(f"    弧长 = {module.arc_length:.1f} cm")
+        
+        if module_idx == 1:
+            print(f"  世界坐标系目标:")
+            print(f"    Roll = {math.degrees(self.module2_world_roll):.1f}°")
+            print(f"    Pitch = {math.degrees(self.module2_world_pitch):.1f}°")
+            
+            # 显示实际末端姿态
+            q = self.robot.get_module_world_orientation(1)
+            R = quaternion_to_rotation_matrix(q)
+            # 末端法向量（Z 轴）
+            normal = R @ np.array([0, 0, -1])
+            print(f"  实际末端法向量: [{normal[0]:.3f}, {normal[1]:.3f}, {normal[2]:.3f}]")
     
     def handle_events(self):
         for event in pygame.event.get():
@@ -819,30 +1309,41 @@ class Renderer:
             
             elif event.type == pygame.KEYDOWN:
                 step = math.radians(3)  # 3度步进
+                module = self._get_active_module()
+                module_idx = self.robot.active_module
                 
                 if event.key == pygame.K_ESCAPE:
                     return False
                 elif event.key == pygame.K_r:
-                    self.robot.set_tilt(0, 0)
-                    self.robot.set_arc_length(DEFAULT_ARC_LENGTH)
+                    # 重置所有模块
+                    for m in self.robot.modules:
+                        m.set_pcc_params(0, 0, DEFAULT_ARC_LENGTH)
+                    self.module2_world_roll = 0.0
+                    self.module2_world_pitch = 0.0
+                    self.robot._update_chain()
                 
-                # Tilt X 控制 (Q/A) - 向 X 方向弯曲
-                elif event.key == pygame.K_q:
-                    self.robot.set_tilt(self.robot.tilt_x + step, self.robot.tilt_y)
-                elif event.key == pygame.K_a:
-                    self.robot.set_tilt(self.robot.tilt_x - step, self.robot.tilt_y)
+                # 切换活动模块 (TAB)
+                elif event.key == pygame.K_TAB:
+                    self.robot.active_module = (self.robot.active_module + 1) % self.robot.num_modules
+                    mode_str = "世界坐标系" if self.robot.active_module > 0 else "局部坐标系"
+                    print(f"\n当前控制: 模块 {self.robot.active_module + 1} ({mode_str})")
+                    self._print_current_state()
                 
-                # Tilt Y 控制 (W/S) - 向 Y 方向弯曲
-                elif event.key == pygame.K_w:
-                    self.robot.set_tilt(self.robot.tilt_x, self.robot.tilt_y + step)
-                elif event.key == pygame.K_s:
-                    self.robot.set_tilt(self.robot.tilt_x, self.robot.tilt_y - step)
+                # WASD 控制
+                # 第一节：局部坐标系（相对于基座）
+                # 第二节：世界坐标系（绝对角度）
+                elif module_idx == 0:
+                    self._handle_local_control(event, module, step)
+                else:
+                    self._handle_world_control(event, step)
                 
-                # 弧长控制 (UP/DOWN)
-                elif event.key == pygame.K_UP:
-                    self.robot.set_arc_length(self.robot.arc_length + 2)
+                # 弧长控制 (UP/DOWN) - 所有模块通用
+                if event.key == pygame.K_UP:
+                    module.set_pcc_params(module.phi, module.theta_bend, module.arc_length + 2)
+                    self.robot._update_chain()
                 elif event.key == pygame.K_DOWN:
-                    self.robot.set_arc_length(self.robot.arc_length - 2)
+                    module.set_pcc_params(module.phi, module.theta_bend, module.arc_length - 2)
+                    self.robot._update_chain()
                 
                 # 切换显示
                 elif event.key == pygame.K_c:
@@ -851,26 +1352,49 @@ class Renderer:
                     self.show_mount = not self.show_mount
                 elif event.key == pygame.K_p:
                     self.show_perpendicularity_check = not self.show_perpendicularity_check
-                    if self.show_perpendicularity_check:
-                        # 验证垂直性
-                        perp = self.robot.fk.verify_perpendicularity(self.robot.pcc_result)
-                        print("\n垂直性验证:")
-                        for p in perp:
-                            print(f"  Actuator {p['actuator']}: "
-                                  f"固定端偏差 {p['angle_at_fixed_end']:.2f}°, "
-                                  f"自由端偏差 {p['angle_at_free_end']:.2f}°")
                 
-                # 预设姿态
+                # 预设姿态（应用于当前模块）
+                # 第一节：局部坐标系，第二节：世界坐标系
                 elif event.key == pygame.K_1:
-                    self.robot.set_tilt(math.radians(25), 0)
+                    if module_idx == 0:
+                        module.set_pcc_params(0, math.radians(25), module.arc_length)
+                    else:
+                        self.module2_world_roll = math.radians(25)
+                        self.module2_world_pitch = 0
+                        self._apply_world_orientation()
+                    self.robot._update_chain()
                 elif event.key == pygame.K_2:
-                    self.robot.set_tilt(math.radians(-25), 0)
+                    if module_idx == 0:
+                        module.set_pcc_params(math.pi, math.radians(25), module.arc_length)
+                    else:
+                        self.module2_world_roll = -math.radians(25)
+                        self.module2_world_pitch = 0
+                        self._apply_world_orientation()
+                    self.robot._update_chain()
                 elif event.key == pygame.K_3:
-                    self.robot.set_tilt(0, math.radians(25))
+                    if module_idx == 0:
+                        module.set_pcc_params(math.pi/2, math.radians(25), module.arc_length)
+                    else:
+                        self.module2_world_roll = 0
+                        self.module2_world_pitch = math.radians(25)
+                        self._apply_world_orientation()
+                    self.robot._update_chain()
                 elif event.key == pygame.K_4:
-                    self.robot.set_tilt(0, math.radians(-25))
+                    if module_idx == 0:
+                        module.set_pcc_params(-math.pi/2, math.radians(25), module.arc_length)
+                    else:
+                        self.module2_world_roll = 0
+                        self.module2_world_pitch = -math.radians(25)
+                        self._apply_world_orientation()
+                    self.robot._update_chain()
                 elif event.key == pygame.K_5:
-                    self.robot.set_tilt(math.radians(20), math.radians(20))
+                    if module_idx == 0:
+                        module.set_pcc_params(math.pi/4, math.radians(25), module.arc_length)
+                    else:
+                        self.module2_world_roll = math.radians(15)
+                        self.module2_world_pitch = math.radians(15)
+                        self._apply_world_orientation()
+                    self.robot._update_chain()
             
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
@@ -912,41 +1436,39 @@ class Renderer:
         running = True
         
         print("\n" + "=" * 70)
-        print("  软体机械臂 PCC 模型渲染器 - 倒挂配置 (正确约束)")
+        print("  多节软体机械臂 PCC 模型渲染器 - 倒挂配置")
         print("  (Piecewise Constant Curvature)")
         print("=" * 70)
+        print(f"  模块数量: {self.robot.num_modules}")
         print(f"  三角形边长: {TRIANGLE_SIDE} cm")
         print(f"  三角形厚度: {TRIANGLE_THICKNESS} cm")
         print(f"  弧长范围: {ACTUATOR_MIN} - {ACTUATOR_MAX} cm")
         print(f"  最大弯曲角: {math.degrees(MAX_BEND_ANGLE):.0f}°")
-        print("\n  PCC 模型自由度:")
-        print("    - φ (phi): 弯曲方向")
-        print("    - θ (theta_bend): 弯曲角度")
-        print("    - s: 弧长")
-        print("    注意: 单段 PCC 无法产生扭转(Yaw)!")
-        print("\n  控制方式 (倾斜角度):")
+        print("\n  控制方式:")
+        print("    TAB: 切换控制的模块")
         print("    Q/A: 向 X+/X- 方向弯曲")
         print("    W/S: 向 Y+/Y- 方向弯曲")
         print("    ↑/↓: 弧长 +/-")
-        print("\n  预设姿态:")
+        print("\n  预设姿态 (当前模块):")
         print("    1: 向 X+ 弯曲    2: 向 X- 弯曲")
         print("    3: 向 Y+ 弯曲    4: 向 Y- 弯曲")
         print("    5: 对角弯曲")
         print("\n  其他控制:")
         print("    C: 切换中心线   M: 切换支架")
-        print("    P: 验证垂直性   R: 重置")
-        print("    ESC: 退出")
+        print("    R: 重置全部     ESC: 退出")
         print("=" * 70 + "\n")
         
         while running:
             running = self.handle_events()
             self.render()
             
-            r = self.robot
-            result = r.pcc_result
-            print(f"\rφ={math.degrees(r.phi):+6.1f}° "
-                  f"θ={math.degrees(r.theta_bend):5.1f}° "
-                  f"s={r.arc_length:.1f}cm "
+            # 显示当前模块的状态
+            m = self._get_active_module()
+            result = m.pcc_result
+            print(f"\r[模块{self.robot.active_module+1}/{self.robot.num_modules}] "
+                  f"φ={math.degrees(m.phi):+6.1f}° "
+                  f"θ={math.degrees(m.theta_bend):5.1f}° "
+                  f"s={m.arc_length:.1f}cm "
                   f"κ={result['kappa']:.4f} | "
                   f"L=[{result['actuator_lengths'][0]:.1f}, "
                   f"{result['actuator_lengths'][1]:.1f}, "
